@@ -136,6 +136,7 @@ type EngineProbeResult struct {
 
 type VerificationMethodStatus struct {
 	Method          waappv1.VerificationDeliveryMethod
+	Code            string
 	Available       bool
 	CooldownSeconds int64
 }

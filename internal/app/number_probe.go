@@ -322,8 +322,13 @@ func objectListField(data map[string]any, key string) []map[string]any {
 func methodStatusMaps(statuses []VerificationMethodStatus) []map[string]any {
 	out := make([]map[string]any, 0, len(statuses))
 	for _, status := range statuses {
+		method := status.Code
+		if method == "" {
+			method = status.Method.String()
+		}
 		out = append(out, map[string]any{
-			"method":           status.Method.String(),
+			"method":           method,
+			"delivery_method":  status.Method.String(),
 			"available":        status.Available,
 			"cooldown_seconds": status.CooldownSeconds,
 		})

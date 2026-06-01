@@ -303,7 +303,7 @@ func availableVerificationMethods(data map[string]any) []waappv1.VerificationDel
 		jsonNumber(data["voice_length"]) > 0 {
 		out = append(out, waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE)
 	}
-	if existAppVerificationSignal(data) {
+	if containsDeliveryMethod(candidates, waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE) || existAppVerificationSignal(data) {
 		out = append(out, waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE)
 	}
 	return out
@@ -327,12 +327,12 @@ func verificationMethods(value any) []waappv1.VerificationDeliveryMethod {
 }
 
 func verificationMethod(name string) waappv1.VerificationDeliveryMethod {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch verificationMethodCode(name) {
 	case "sms", "send_sms":
 		return waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS
 	case "voice":
 		return waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE
-	case "in_app", "in_app_message", "wa_old", "email_otp", "passkey":
+	case "in_app", "in_app_message", "wa_old", "email_otp", "passkey", "flash":
 		return waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE
 	default:
 		return waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_UNSPECIFIED
@@ -340,35 +340,93 @@ func verificationMethod(name string) waappv1.VerificationDeliveryMethod {
 }
 
 func verificationMethodStatuses(data map[string]any, methods []waappv1.VerificationDeliveryMethod) []VerificationMethodStatus {
-	seen := map[waappv1.VerificationDeliveryMethod]VerificationMethodStatus{}
-	for _, method := range methods {
-		seen[method] = VerificationMethodStatus{Method: method, Available: true, CooldownSeconds: verificationCooldownSeconds(data, method)}
-	}
-	for _, method := range []waappv1.VerificationDeliveryMethod{
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS,
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE,
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE,
-	} {
-		cooldown := verificationCooldownSeconds(data, method)
+	seen := map[string]VerificationMethodStatus{}
+	order := []string{}
+	add := func(code string, method waappv1.VerificationDeliveryMethod, available bool, cooldown int64) {
+		if code == "" || method == waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_UNSPECIFIED {
+			return
+		}
+		if !available && cooldown <= 0 {
+			return
+		}
+		if _, ok := seen[code]; !ok {
+			order = append(order, code)
+		}
+		previous := seen[code]
+		previous.Code = code
+		previous.Method = method
+		previous.Available = previous.Available || available
 		if cooldown <= 0 {
+			cooldown = previous.CooldownSeconds
+		}
+		previous.CooldownSeconds = cooldown
+		seen[code] = previous
+	}
+	for _, raw := range stringList(data["fallback_methods"]) {
+		code := verificationMethodCode(raw)
+		add(code, verificationMethod(code), true, verificationCodeCooldownSeconds(data, code))
+	}
+	for _, method := range methods {
+		code := defaultVerificationMethodCode(method)
+		if method == waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE && hasSpecificInAppMethod(seen) {
 			continue
 		}
-		status := seen[method]
-		status.Method = method
-		status.CooldownSeconds = cooldown
-		seen[method] = status
+		add(code, method, true, verificationCooldownSeconds(data, method))
 	}
+	add("sms", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS, false, verificationCodeCooldownSeconds(data, "sms"))
+	add("voice", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE, false, verificationCodeCooldownSeconds(data, "voice"))
+	add("wa_old", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE, false, verificationCodeCooldownSeconds(data, "wa_old"))
+	add("email_otp", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE, false, verificationCodeCooldownSeconds(data, "email_otp"))
+	add("flash", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE, false, verificationCodeCooldownSeconds(data, "flash"))
+	add("passkey", waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE, false, verificationCodeCooldownSeconds(data, "passkey"))
 	out := make([]VerificationMethodStatus, 0, len(seen))
-	for _, method := range []waappv1.VerificationDeliveryMethod{
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS,
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE,
-		waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE,
-	} {
-		if status, ok := seen[method]; ok {
-			out = append(out, status)
-		}
+	for _, code := range order {
+		out = append(out, seen[code])
 	}
 	return out
+}
+
+func verificationMethodCode(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "sms", "send_sms":
+		return "sms"
+	case "voice", "send_voice":
+		return "voice"
+	case "wa_old", "wa-old", "old_wa":
+		return "wa_old"
+	case "email", "email_otp", "email-otp":
+		return "email_otp"
+	case "flash":
+		return "flash"
+	case "passkey":
+		return "passkey"
+	case "in_app", "in_app_message":
+		return "in_app"
+	default:
+		return ""
+	}
+}
+
+func defaultVerificationMethodCode(method waappv1.VerificationDeliveryMethod) string {
+	switch method {
+	case waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS:
+		return "sms"
+	case waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_VOICE:
+		return "voice"
+	case waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE:
+		return "in_app"
+	default:
+		return ""
+	}
+}
+
+func hasSpecificInAppMethod(seen map[string]VerificationMethodStatus) bool {
+	for _, code := range []string{"passkey", "wa_old", "email_otp", "flash"} {
+		if _, ok := seen[code]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func verificationCooldownSeconds(data map[string]any, method waappv1.VerificationDeliveryMethod) int64 {
@@ -379,6 +437,27 @@ func verificationCooldownSeconds(data map[string]any, method waappv1.Verificatio
 		return firstJSONInt64(data["voice_wait"], data["send_voice_wait"], data["voice_retry_after"], data["send_voice_retry_after"])
 	case waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_IN_APP_MESSAGE:
 		return firstJSONInt64(data["wa_old_wait"], data["email_otp_wait"], data["in_app_wait"], data["device_confirm_wait"], data["passkey_wait"])
+	default:
+		return 0
+	}
+}
+
+func verificationCodeCooldownSeconds(data map[string]any, code string) int64 {
+	switch code {
+	case "sms":
+		return firstJSONInt64(data["sms_wait"], data["send_sms_wait"], data["sms_retry_after"], data["send_sms_retry_after"])
+	case "voice":
+		return firstJSONInt64(data["voice_wait"], data["send_voice_wait"], data["voice_retry_after"], data["send_voice_retry_after"])
+	case "wa_old":
+		return firstJSONInt64(data["wa_old_wait"])
+	case "email_otp":
+		return firstJSONInt64(data["email_otp_wait"])
+	case "flash":
+		return firstJSONInt64(data["flash_wait"])
+	case "passkey":
+		return firstJSONInt64(data["passkey_wait"])
+	case "in_app":
+		return firstJSONInt64(data["wa_old_wait"], data["email_otp_wait"], data["flash_wait"], data["in_app_wait"], data["device_confirm_wait"], data["passkey_wait"])
 	default:
 		return 0
 	}

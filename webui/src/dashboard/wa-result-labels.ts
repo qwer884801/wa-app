@@ -24,6 +24,14 @@ export function cooldownLabel(value?: number | null) {
   return value && value > 0 ? `冷却 ${formatSeconds(value)}` : '';
 }
 
+export function methodStateLabel(available?: boolean, cooldownSeconds?: number | null) {
+  const cooldown = cooldownLabel(cooldownSeconds);
+  if (cooldown) return cooldown;
+  if (available === true) return '可用';
+  if (available === false) return '不可用';
+  return '未知';
+}
+
 export function toneClass(tone: Tone, chip = false) {
   const base = tone === 'ok' ? 'text-primary' : tone === 'bad' ? 'text-destructive' : tone === 'warn' ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground';
   if (!chip) return base;
@@ -52,6 +60,10 @@ export function methodLabel(value: string) {
   if (normalized === 'SMS') return 'SMS';
   if (normalized === 'VOICE') return '语音';
   if (normalized === 'IN_APP_MESSAGE') return 'App 验证';
+  if (normalized === 'PASSKEY') return 'Passkey';
+  if (normalized === 'WA_OLD' || normalized === 'OLD_WA') return 'WA 旧设备';
+  if (normalized === 'EMAIL' || normalized === 'EMAIL_OTP') return '邮箱';
+  if (normalized === 'FLASH') return 'Flash';
   return normalized.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase());
 }
 

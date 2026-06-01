@@ -1,6 +1,6 @@
 import { Badge } from '@byte-v-forge/common-ui';
 import type { WaWorkflowResponse } from './wa-api';
-import { booleanLabel, cooldownLabel, registeredLabel, smsLabel, toneClass, type Tone } from './wa-result-labels';
+import { booleanLabel, methodStateLabel, registeredLabel, smsLabel, toneClass, type Tone } from './wa-result-labels';
 import { metaItems, outcomeMeta, waProbeStatus, type VerificationMethodStatus, type WaProbeStatus } from './wa-result-model';
 
 export function WaResultPanel({ title, phone, result, loading }: { title: string; phone?: string; result?: WaWorkflowResponse | null; loading?: boolean }) {
@@ -43,7 +43,7 @@ function MetricChip({ label, value, tone }: { label: string; value: string; tone
 
 function MethodGroup({ methods }: { methods: VerificationMethodStatus[] }) {
   if (methods.length === 0) return null;
-  return <span className="inline-flex items-center gap-1 text-muted-foreground"><span>方式</span>{methods.map((method) => <span key={method.key} className="rounded bg-muted/60 px-1.5 py-0.5 font-medium text-foreground">{method.label}{cooldownLabel(method.cooldownSeconds) ? ` · ${cooldownLabel(method.cooldownSeconds)}` : ''}</span>)}</span>;
+  return <span className="inline-flex flex-wrap items-center gap-1 text-muted-foreground"><span>方式</span>{methods.map((method) => <span key={method.key} className="rounded bg-muted/60 px-1.5 py-0.5 font-medium text-foreground">{method.label} · {methodStateLabel(method.available, method.cooldownSeconds)}</span>)}</span>;
 }
 
 function MetaItem({ label, value, tone = 'idle' }: { label: string; value: string; tone?: Tone }) {
