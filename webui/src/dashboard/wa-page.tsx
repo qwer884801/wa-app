@@ -8,13 +8,12 @@ import {
   WorkspaceTabbedPanel,
   accountCarrierID,
   accountSubjectRenderConfig,
-  deleteAccountCarrier,
   useAccountActionRunner,
   useAccountManagementController,
   useAccountProbeAction,
   useQuery,
   useToastMessage,
-  type AccountListPagination,
+  type AccountManagementController,
   type AccountManagementControllerOptions,
 } from '@byte-v-forge/common-ui';
 import type { ListWAAccountsResponse } from '../proto/byte/v/forge/waapp/v1/profile';
@@ -70,36 +69,21 @@ function ToolboxTab(props: { result: WaWorkflowResponse | null; phone: string; b
   return <div className="p-3"><WaPhoneSMSProbeForm disabled={props.busy} resultSlot={hasResult ? <WaResultPanel title="探测结果" phone={props.phone} result={props.result} loading={props.busy} /> : undefined} onCheck={props.onCheck} onError={props.onError} /></div>;
 }
 
-type WaAccountController = {
-  accounts: WaAccountProjection[];
-  selectedID: string;
-  selected: WaAccountProjection | null;
-  isLoading: boolean;
-  actionBusy: boolean;
-  accountsPagination?: AccountListPagination;
-  invalidate: () => Promise<void>;
-  selectAccount: (account: WaAccountProjection) => void;
-  clearSelection: () => void;
-};
-
-function WaAccountsTab(props: { controller: WaAccountController; onAccountAdded: () => void | Promise<void>; onActionDone: (message: string) => void; onError: (message: unknown) => void }) {
+function WaAccountsTab(props: { controller: AccountManagementController<WaAccountProjection, ListWAAccountsResponse>; onAccountAdded: () => void | Promise<void>; onActionDone: (message: string) => void; onError: (message: unknown) => void }) {
   const [actionResult, setActionResult] = useState<WaAccountActionResult | null>(null);
   const runner = useAccountActionRunner();
   const busy = props.controller.isLoading || props.controller.actionBusy || runner.busy;
   const renderConfig = accountSubjectRenderConfig({ icon: () => <Smartphone size={15} /> });
   async function deleteAccount(account: WaAccountProjection) {
     const accountID = accountCarrierID(account);
-    await runner.tryRunAccountAction('wa-delete', account, async () => {
-      const deleted = await deleteAccountCarrier(account, {
-        deleteByID: () => deleteWaAccount(account, ACCOUNT_WORKSPACE_ID),
-        confirmMessage: () => `删除 WAAccount ${accountID}？`,
-        invalidate: async () => {
-          props.controller.clearSelection();
-          await props.controller.invalidate();
-        },
-      });
-      if (deleted) props.onActionDone('WAAccount 已删除');
-    }, { onError: props.onError });
+    await props.controller.deleteAccount(account, () => deleteWaAccount(account, ACCOUNT_WORKSPACE_ID), {
+      actionID: 'wa-delete',
+      confirmMessage: () => `删除 WAAccount ${accountID}？`,
+      onSuccess: (deleted) => {
+        if (deleted) props.onActionDone('WAAccount 已删除');
+      },
+      onError: props.onError,
+    });
   }
   return <AccountManagementDrawerView title="WAAccount" icon={<Smartphone size={16} />} actions={<WaAccountAdd disabled={busy} onCreated={props.onAccountAdded} onError={props.onError} />} carriers={props.controller.accounts} selectedCarrier={props.controller.selected} selectedID={props.controller.selectedID} onSelectCarrier={props.controller.selectAccount} loading={props.controller.isLoading} loadingText="加载 WAAccount..." emptyText="暂无已持久化 WAAccount" pagination={props.controller.accountsPagination} config={renderConfig} drawerDescription="WA 账号详情" detailTabs={waAccountDetailTabs({ actionResult, busy, onRegister: (account) => runWAAccountAction('register', account, runner, setActionResult, { ...props, onAccountsChanged: props.controller.invalidate }), onProbe: (account) => runWAAccountAction('probe', account, runner, setActionResult, { ...props, onAccountsChanged: props.controller.invalidate }), onDelete: deleteAccount, onManualOTPDone: props.onActionDone, onError: props.onError })} onCloseDetails={props.controller.clearSelection} />;
 }
