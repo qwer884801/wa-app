@@ -155,3 +155,14 @@ function deriveAccountFlow(input: { registered?: boolean; blocked?: boolean; sms
   if (raw.includes('too_recent') || raw.includes('too_many') || raw.includes('temporarily_unavailable')) return 'rate_limited';
   return 'unknown';
 }
+
+export function waProbeCanStartRegistration(result?: WaWorkflowResponse | null) {
+  const status = waProbeStatus(result);
+  return Boolean(result)
+    && !status.requestFailed
+    && status.smsAvailable === true
+    && status.accountReachable !== false
+    && status.blocked !== true
+    && status.accountFlow !== 'invalid_number'
+    && status.accountFlow !== 'rate_limited';
+}

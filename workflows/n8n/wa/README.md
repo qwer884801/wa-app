@@ -1,13 +1,13 @@
 # WA n8n 工作流
 
-本目录保存 WA 应用链路的 n8n 编排定义。编排只串联原子动作，不把 Python 脚本作为运行时桥接；设备指纹、注册请求、登录态等具体能力由 `wa-app` 的原子服务或其 HTTP action gateway 提供。
+本目录保存 WA 可选外部 n8n 编排定义。WA 主链路由 `wa-app` 原生服务闭环；n8n 只作为自动化增强入口，串联 `wa-app` HTTP action gateway 的原子动作。
 
 ## 工作流
 
 | 文件 | 触发方式 | 职责 |
 | --- | --- | --- |
 | `proxy/wa-us-dynamic-ip.workflow.json` | Execute Workflow | 从 proxy-runtime `/leases/acquire` 申请美国随机动态 IP lease，返回工作流内部使用的代理 URL 和对外摘要；不做预检。 |
-| `registration/wa-register.workflow.json` | Webhook `POST /wa/register` | 申请动态 IP，生成并提交注册用随机设备指纹，发起 SMS OTP，等待 OTP 回调，提交验证码并持久化登录态；号码探测不进入 n8n。 |
+| `registration/wa-register.workflow.json` | Webhook `POST /wa/register` | 可选外部注册编排示例；主前端 `/api/wa/register` 已由 `wa-app` 原生编排处理。 |
 
 ## 运行环境变量
 
@@ -18,7 +18,7 @@
 
 ### 号码/SMS 检测
 
-号码探测不属于 n8n 编排。前端工具箱对外入口是 `POST /api/wa/phone/sms-probe`，由 wa-app BFF 直连原子能力；该入口要求手机号和国家拨号码，每次探测生成随机设备指纹但不持久化，使用 1 分钟 proxy-runtime 美国随机动态 IP 短租约，用完立即释放。输出包含 `phone_status.account_status`、`phone_status.registered`、`phone_status.blocked`、`phone_status.sms_available`、`phone_status.sms_wait_seconds` 和动态代理摘要，`fingerprint_persistence` 固定为 `RANDOM_NOT_COMMITTED`。
+号码探测不属于 n8n 编排。前端工具箱对外入口是 `POST /api/wa/phone/sms-probe`，由 wa-app BFF 直连原子能力；该入口要求手机号和国家拨号码，每次探测生成随机设备指纹但不持久化。配置 proxy-runtime 时使用 1 分钟美国轮转动态 IP 短租约，用完立即释放；未配置时直连执行。输出包含 `phone_status.account_status`、`phone_status.registered`、`phone_status.blocked`、`phone_status.sms_available`、`phone_status.sms_wait_seconds` 和动态代理摘要，`fingerprint_persistence` 固定为 `RANDOM_NOT_COMMITTED`。
 
 ### 注册
 
@@ -32,14 +32,14 @@
 }
 ```
 
-注册工作流不执行号码探测。它在动态 IP 可用后调用 `/fingerprints/random` 生成注册用随机设备指纹，再调用 `/fingerprints/commit` 固化到该号码的 `wa_account_id` / `client_profile_id`。随后请求 SMS OTP，并把 `$execution.resumeUrl` 注册到 `/registration/await-otp`。
+`wa-app` 原生注册入口不执行号码探测。它生成注册用随机设备指纹，提交为 `wa_account_id` / `client_profile_id`，随后请求 SMS OTP，并在 WA 自有 runtime state 中保存 OTP 等待态。n8n workflow 仍可作为外部编排器调用这些原子动作。
 
 代理策略细节：
 
-- 号码探测由 wa-app BFF 直连原子能力；若上游传入 `proxy_state_json`，注册工作流复用该动态 IP，否则自行申请独立 proxy-runtime 美国随机动态 IP lease。`wa-app` action gateway 只在内部使用 `proxy_url` 发起 WA 请求。
+- 号码探测由 wa-app BFF 直连原子能力；若上游传入 `proxy_state_json`，注册流程复用该代理。配置 proxy-runtime 时注册使用美国粘性动态 IP lease；未配置时直连执行。`wa-app` action gateway 只在内部使用 `proxy_url` 发起 WA 请求。
 - 动态 IP 只按 `country_code: "US"` 申请；不做出口 IP、风控、CF 或目标连通性预检，不按 workspace、号码、账号、号码国家或地区绑定代理。
 - 终态分支会调用 `/leases/release` 释放本次 lease。
-- 最终响应只返回 `{ "proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US" }` 等非敏感摘要，不返回具体代理 URL 或凭据。
+- 最终响应只返回 `{ "proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US" }` 等非敏感摘要，不返回具体代理 URL 或凭据。
 
 OTP 回调向 n8n wait 节点的 resume URL 发送：
 
@@ -70,7 +70,7 @@ OTP 回调向 n8n wait 节点的 resume URL 发送：
 ## 状态边界
 
 - 检测：只使用随机 fingerprint 发起一次探测，返回号码状态，不写长期 profile，不产生可提交的 fingerprint 引用。
-- 注册：注册工作流自行生成并 commit 注册用 fingerprint，并把登录态作为长期事实保存；登录态未激活时注册工作流返回失败。登录态激活后由 wa-app 自动启动消息长连接，不需要额外 workflow。
+- 注册：wa-app 原生编排生成并 commit 注册用 fingerprint，并把登录态作为长期事实保存；登录态未激活时返回失败。登录态激活后由 wa-app 自动启动消息长连接，不需要额外 workflow。
 - 登录态检测：远端握手成功会刷新 `last_verified_at` 并触发长连接恢复；明确失效会把登录态置为 `INVALID`；代理/网络不可达只返回 `UNREACHABLE` 检测结果，不把账号直接判失效。
 - 等待 OTP、幂等窗口属于短期运行态，应设置 TTL。
 - 响应中避免返回 token、authkey、cookie、OTP、可复用请求体、代理凭据等敏感材料。

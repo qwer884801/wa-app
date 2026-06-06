@@ -25,14 +25,14 @@ var nativeSensitiveDigitsPattern = regexp.MustCompile(`\b[0-9]{4,8}\b`)
 var chatdNodeTokenErrorPattern = regexp.MustCompile(`(?i)(readstring could not match token|invalid list-size token)\s+([0-9]{1,3})`)
 
 type NativeEngine struct {
-	stateStore     Store
+	stateStore     NativeStateStore
 	activeProxyURL string
 	http           *nativeHTTPClient
 	clock          Clock
 	ids            IDGenerator
 }
 
-func NewNativeEngine(stateStore Store, clock Clock, ids IDGenerator) (*NativeEngine, error) {
+func NewNativeEngine(stateStore NativeStateStore, clock Clock, ids IDGenerator) (*NativeEngine, error) {
 	if stateStore == nil {
 		return nil, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_INTERNAL, "native state store is required", false)
 	}
@@ -56,6 +56,13 @@ func (e *NativeEngine) WithProxyURL(proxyURL string) (*NativeEngine, error) {
 		return nil, err
 	}
 	return &NativeEngine{stateStore: e.stateStore, activeProxyURL: proxyURL, http: hc, clock: e.clock, ids: e.ids}, nil
+}
+
+func (e *NativeEngine) CloseIdleConnections() {
+	if e == nil || e.http == nil {
+		return
+	}
+	e.http.CloseIdleConnections()
 }
 
 func (e *NativeEngine) PrepareClientProfile(ctx context.Context, input EngineProfileInput) error {
@@ -614,11 +621,11 @@ func classifyHTTPError(data map[string]any, err error) error {
 	status := responseStatus(data)
 	switch status {
 	case "no_routes":
-		return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "verification route is unavailable", false)
+		return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "no_routes: verification route is unavailable", false)
 	case "too_recent":
 		return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_RATE_LIMITED, "verification request is too recent", true)
 	case "blocked", "rejected":
-		return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_REJECTED, "request was rejected", false)
+		return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_REJECTED, status+": request was rejected", false)
 	}
 	return NewError(waappv1.WaErrorCode_WA_ERROR_CODE_REJECTED, upstreamFailureMessage(data, err), true)
 }

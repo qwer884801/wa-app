@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@source "./";
+@source "../../../common-lib/ui/src";
+@import "@byte-v-forge/common-ui/styles.css";
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}

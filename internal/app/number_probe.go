@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	waappv1 "github.com/byte-v-forge/wa-app/gen/go/byte/v/forge/waapp/v1"
 )
 
-const numberProbeProxyLeaseTTL = time.Minute
+const (
+	numberProbeProxyLeaseTTL = time.Minute
+	numberProbeMaxAttempts   = 3
+)
 
 func (s *Server) ProbeNumberSMS(ctx context.Context, payload map[string]any) (map[string]any, error) {
 	if payload == nil {
@@ -32,42 +36,82 @@ func (s *Server) ProbeNumberSMS(ctx context.Context, payload map[string]any) (ma
 		logNumberProbeResult(ctxData, phone, DynamicProxyLease{}, result)
 		return result, nil
 	}
+	var lastResult map[string]any
+	var lastLease DynamicProxyLease
+	for attempt := 1; attempt <= numberProbeMaxAttempts; attempt++ {
+		result, lease, retry, reason := s.probeNumberSMSAttempt(ctx, payload, ctxData, phone, engine, attempt)
+		lastResult, lastLease = result, lease
+		if !retry || attempt == numberProbeMaxAttempts {
+			if retry {
+				markNumberProbeRetriesExhausted(result)
+			}
+			logNumberProbeResult(ctxData, phone, lease, result)
+			return result, nil
+		}
+		logNumberProbeRetry(ctxData, phone, lease, attempt, numberProbeMaxAttempts, reason)
+		if !waitNumberProbeRetry(ctx, attempt) {
+			logNumberProbeResult(ctxData, phone, lease, result)
+			return result, nil
+		}
+	}
+	logNumberProbeResult(ctxData, phone, lastLease, lastResult)
+	return lastResult, nil
+}
+
+func (s *Server) probeNumberSMSAttempt(ctx context.Context, payload map[string]any, ctxData *waappv1.RequestContext, phone *waappv1.PhoneTarget, engine *NativeEngine, attempt int) (map[string]any, DynamicProxyLease, bool, string) {
 	lease, proxyURL, proxy, releaseProxy, err := s.numberProbeProxy(ctx, payload, ctxData.GetCorrelationId())
 	if err != nil {
 		result := numberProbeProxyFailure(payload, err)
-		logNumberProbeResult(ctxData, phone, DynamicProxyLease{}, result)
-		return result, nil
+		annotateNumberProbeAttempt(result, attempt)
+		return result, DynamicProxyLease{}, false, ""
 	}
-	defer releaseProxy()
 
-	probeEngine, err := engine.WithProxyURL(proxyURL)
-	if err != nil {
-		result := numberProbeError(payload, err)
-		logNumberProbeResult(ctxData, phone, lease, result)
-		return result, nil
+	probeEngine := engine
+	defer func() {
+		if proxyURL != "" {
+			probeEngine.CloseIdleConnections()
+		}
+		releaseProxy()
+	}()
+	if proxyURL != "" {
+		probeEngine, err = engine.WithProxyURL(proxyURL)
+		if err != nil {
+			result := numberProbeError(payload, err)
+			annotateNumberProbeAttempt(result, attempt)
+			return result, lease, false, ""
+		}
 	}
 	state, err := probeEngine.newState(phone)
 	if err != nil {
 		result := numberProbeError(payload, err)
-		logNumberProbeResult(ctxData, phone, lease, result)
-		return result, nil
+		annotateNumberProbeAttempt(result, attempt)
+		return result, lease, false, ""
 	}
 	fingerprint := map[string]any{
 		"fingerprint_persistence": "RANDOM_NOT_COMMITTED",
 		"fingerprint":             fingerprintSummary(phoneProfileToProto(phone, state.Profile)),
 	}
-	account := probeResultMap(probeEngine.probeAccountWithState(ctx, EngineRegistrationInput{WorkspaceID: ctxData.GetWorkspaceId(), Phone: phone}, state))
+	probeResult := probeEngine.probeAccountWithState(ctx, EngineRegistrationInput{WorkspaceID: ctxData.GetWorkspaceId(), Phone: phone}, state)
+	account := probeResultMap(probeResult)
 	sms := smsProbeMap(account)
 	result := buildNumberProbeResult(payload, proxy, fingerprint, account, sms)
-	logNumberProbeResult(ctxData, phone, lease, result)
-	return result, nil
+	annotateNumberProbeAttempt(result, attempt)
+	if retryableNumberProbeAttempt(proxy, probeResult) {
+		return result, lease, true, numberProbeRetryReason(probeResult.Err)
+	}
+	return result, lease, false, ""
 }
 
 func (s *Server) acquireNumberProbeProxy(ctx context.Context, correlationID string) (DynamicProxyLease, error) {
 	if s == nil || s.proxyRuntime == nil {
 		return DynamicProxyLease{}, fmt.Errorf("PROXY_RUNTIME_API_BASE_URL is required")
 	}
-	return s.proxyRuntime.AcquireUSDynamic(ctx, "WA_NUMBER_PROBE", correlationID, numberProbeProxyLeaseTTL)
+	return s.proxyRuntime.AcquireUSDynamicLease(ctx, DynamicProxyLeaseRequest{
+		Purpose:       "WA_NUMBER_PROBE",
+		CorrelationID: correlationID,
+		TTL:           numberProbeProxyLeaseTTL,
+		Mode:          DynamicProxySessionModeRotating,
+	})
 }
 
 func (s *Server) numberProbeProxy(ctx context.Context, payload map[string]any, correlationID string) (DynamicProxyLease, string, map[string]any, func(), error) {
@@ -75,12 +119,17 @@ func (s *Server) numberProbeProxy(ctx context.Context, payload map[string]any, c
 		proxy := map[string]any{"success": true, "accepted": true, "proxy_mode": "SHARED_DYNAMIC_IP", "country_code": firstNonEmpty(countryCode, "UNKNOWN"), "account_id": lease.AccountID, "lease_id": lease.LeaseID}
 		return lease, proxyURL, proxy, func() {}, nil
 	}
+	if s == nil || s.proxyRuntime == nil {
+		proxy := map[string]any{"success": true, "accepted": true, "proxy_mode": "DIRECT", "country_code": "LOCAL"}
+		return DynamicProxyLease{}, "", proxy, func() {}, nil
+	}
 	lease, err := s.acquireNumberProbeProxy(ctx, correlationID)
 	if err != nil {
-		return DynamicProxyLease{}, "", nil, func() {}, err
+		proxy := map[string]any{"success": true, "accepted": true, "proxy_mode": "DIRECT_FALLBACK", "country_code": "LOCAL", "fallback_reason": "dynamic_proxy_unavailable"}
+		return DynamicProxyLease{}, "", proxy, func() {}, nil
 	}
-	proxy := map[string]any{"success": true, "accepted": true, "proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US", "account_id": lease.AccountID, "lease_id": lease.LeaseID}
-	return lease, lease.ProxyURL, proxy, func() { s.proxyRuntime.Release(context.Background(), lease.AccountID) }, nil
+	proxy := map[string]any{"success": true, "accepted": true, "proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US", "account_id": lease.AccountID, "lease_id": lease.LeaseID}
+	return lease, lease.ProxyURL, proxy, func() { s.proxyRuntime.ReleaseLease(context.Background(), lease) }, nil
 }
 
 func sharedNumberProbeProxy(payload map[string]any) (string, DynamicProxyLease, string) {
@@ -124,7 +173,7 @@ func buildNumberProbeResult(input map[string]any, proxy map[string]any, fingerpr
 	if requestFailed {
 		accountFlow = accountProbeFlowProbeFailed
 	}
-	canRegister := canRegisterValue(requestSucceeded, accountReachable, smsAvailable, registeredKnown, registered, blocked, accountFlow)
+	canRegister := canRegisterValue(requestSucceeded, accountReachable, smsAvailable, blocked, accountFlow)
 	failureReason := ""
 	if requestFailed {
 		failureReason = numberProbeFailureReason(proxyAccepted, accountStatus, accountRawStatus, accountRawReason, accountError)
@@ -136,7 +185,7 @@ func buildNumberProbeResult(input map[string]any, proxy map[string]any, fingerpr
 		"error_message":           failureReason,
 		"reject_reason":           failureReason,
 		"phone":                   objectField(input, "phone"),
-		"proxy":                   map[string]any{"proxy_mode": firstNonEmpty(textField(proxy, "proxy_mode"), "US_RANDOM_DYNAMIC_IP"), "country_code": firstNonEmpty(textField(proxy, "country_code"), "US")},
+		"proxy":                   map[string]any{"proxy_mode": firstNonEmpty(textField(proxy, "proxy_mode"), "US_ROTATING_DYNAMIC_IP"), "country_code": firstNonEmpty(textField(proxy, "country_code"), "US")},
 		"fingerprint_persistence": firstNonEmpty(textField(fingerprint, "fingerprint_persistence"), "RANDOM_NOT_COMMITTED"),
 		"fingerprint":             objectField(fingerprint, "fingerprint"),
 		"account_probe":           account,
@@ -190,17 +239,16 @@ func numberProbeFailureReason(proxyAccepted bool, accountStatus string, accountR
 	return "account probe request failed: " + firstNonEmpty(accountRawReason, accountRawStatus, accountStatus, "UNKNOWN")
 }
 
-func canRegisterValue(requestSucceeded bool, accountReachable bool, smsAvailable bool, registeredKnown bool, registered bool, blocked bool, accountFlow string) any {
+func canRegisterValue(requestSucceeded bool, accountReachable bool, smsAvailable bool, blocked bool, accountFlow string) bool {
 	if !requestSucceeded || !accountReachable || !smsAvailable || blocked {
 		return false
 	}
-	if !registeredKnown {
-		if accountFlow == accountProbeFlowNotRegistered {
-			return true
-		}
-		return nil
+	switch accountFlow {
+	case accountProbeFlowInvalidNumber, accountProbeFlowRateLimited, accountProbeFlowProbeFailed:
+		return false
+	default:
+		return true
 	}
-	return !registered
 }
 
 func optionalBoolValue(value bool, known bool) any {
@@ -218,7 +266,7 @@ func numberProbeProxyFailure(payload map[string]any, err error) map[string]any {
 		"error_message":           err.Error(),
 		"reject_reason":           err.Error(),
 		"phone":                   objectField(payload, "phone"),
-		"proxy":                   map[string]any{"proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US"},
+		"proxy":                   map[string]any{"proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US"},
 		"fingerprint_persistence": "NOT_CREATED",
 		"phone_status": map[string]any{
 			"account_status":    "UNKNOWN",
@@ -234,6 +282,97 @@ func numberProbeProxyFailure(payload map[string]any, err error) map[string]any {
 			"method_statuses":   []map[string]any{},
 			"can_register":      false,
 		},
+	}
+}
+
+func retryableNumberProbeAttempt(proxy map[string]any, result EngineProbeResult) bool {
+	if textField(proxy, "proxy_mode") != "US_ROTATING_DYNAMIC_IP" {
+		return false
+	}
+	return retryableNumberProbeTransportError(result.Err)
+}
+
+func retryableNumberProbeTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		switch appErr.Code {
+		case waappv1.WaErrorCode_WA_ERROR_CODE_RATE_LIMITED,
+			waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE,
+			waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED:
+			return false
+		}
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"eof",
+		"connection reset",
+		"connection refused",
+		"unexpected close",
+		"i/o timeout",
+		"timeout awaiting response",
+		"context deadline exceeded",
+		"tls handshake",
+		"proxyconnect",
+		"network is unreachable",
+		"no such host",
+		"wasafe upstream http 5",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func numberProbeRetryReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	reason := strings.Join(strings.Fields(err.Error()), " ")
+	if len(reason) > 160 {
+		return reason[:160]
+	}
+	return reason
+}
+
+func waitNumberProbeRetry(ctx context.Context, attempt int) bool {
+	delay := time.Duration(attempt) * 300 * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func annotateNumberProbeAttempt(result map[string]any, attempt int) {
+	if result == nil {
+		return
+	}
+	result["probe_attempt"] = attempt
+	result["max_probe_attempts"] = numberProbeMaxAttempts
+	if phoneStatus := objectField(result, "phone_status"); len(phoneStatus) > 0 {
+		phoneStatus["probe_attempt"] = attempt
+		phoneStatus["max_probe_attempts"] = numberProbeMaxAttempts
+	}
+	if proxy := objectField(result, "proxy"); len(proxy) > 0 {
+		proxy["probe_attempt"] = attempt
+		proxy["max_probe_attempts"] = numberProbeMaxAttempts
+	}
+}
+
+func markNumberProbeRetriesExhausted(result map[string]any) {
+	if result == nil {
+		return
+	}
+	result["retry_exhausted"] = true
+	if phoneStatus := objectField(result, "phone_status"); len(phoneStatus) > 0 {
+		phoneStatus["retry_exhausted"] = true
 	}
 }
 
@@ -266,6 +405,24 @@ func logNumberProbeResult(ctxData *waappv1.RequestContext, phone *waappv1.PhoneT
 		boolField(phoneStatus, "sms_available"),
 		firstNumberValue(phoneStatus, "sms_wait_seconds"),
 		probeLogValue(firstNonEmpty(textField(result, "error_message"), textField(phoneStatus, "account_error"))),
+	)
+}
+
+func logNumberProbeRetry(ctxData *waappv1.RequestContext, phone *waappv1.PhoneTarget, lease DynamicProxyLease, attempt int, maxAttempts int, reason string) {
+	phoneHash := ""
+	if phone != nil && phone.GetE164Number() != "" {
+		phoneHash = stableID(phone.GetE164Number())
+	}
+	log.Printf(
+		"wa_phone_probe_retry workspace=%s correlation=%s phone_hash=%s proxy_account=%s lease_id=%s attempt=%d max_attempts=%d reason=%s",
+		probeLogValue(ctxData.GetWorkspaceId()),
+		probeLogValue(ctxData.GetCorrelationId()),
+		phoneHash,
+		probeLogValue(lease.AccountID),
+		probeLogValue(lease.LeaseID),
+		attempt,
+		maxAttempts,
+		probeLogValue(reason),
 	)
 }
 

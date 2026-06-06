@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/byte-v-forge/common-lib/grpchealth"
@@ -22,15 +23,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := app.NewPostgresStore(ctx, cfg.PGDSN)
+	store, err := newDurableStore(ctx, cfg)
 	if err != nil {
-		log.Fatalf("initialize wa-app postgres store: %v", err)
+		log.Fatalf("initialize wa-app durable store: %v", err)
 	}
 	defer store.Close()
 
-	runtime, err := app.NewRedisRuntime(ctx, cfg.RedisURL)
+	runtime, err := newRuntimeState(ctx, cfg)
 	if err != nil {
-		log.Fatalf("initialize wa-app redis runtime: %v", err)
+		log.Fatalf("initialize wa-app runtime state: %v", err)
 	}
 	defer func() { _ = runtime.Close() }()
 
@@ -47,8 +48,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("initialize wa-app platform event bus: %v", err)
 	}
-	defer platformBus.Close()
-	service.SetPlatformPublisher(platformBus)
+	if platformBus != nil {
+		defer platformBus.Close()
+		service.SetPlatformPublisher(platformBus)
+	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -89,9 +92,29 @@ func main() {
 	}
 }
 
+func newDurableStore(ctx context.Context, cfg config.Config) (app.Store, error) {
+	if strings.TrimSpace(cfg.PGDSN) != "" {
+		return app.NewPostgresStore(ctx, cfg.PGDSN)
+	}
+	log.Printf("WA_APP_PG_DSN is not configured; wa-app uses sqlite durable store in %s", cfg.DataDir)
+	return app.NewSQLiteStore(ctx, cfg.DataDir)
+}
+
+func newRuntimeState(ctx context.Context, cfg config.Config) (app.RuntimeState, error) {
+	if strings.TrimSpace(cfg.RedisURL) != "" {
+		return app.NewRedisRuntime(ctx, cfg.RedisURL)
+	}
+	log.Printf("PLATFORM_REDIS_URL is not configured; wa-app uses sqlite runtime state in %s", cfg.DataDir)
+	return app.NewSQLiteRuntime(ctx, cfg.DataDir)
+}
+
 func newPlatformEventBus(cfg config.Config) (*natseventbus.Bus, error) {
+	if strings.TrimSpace(cfg.PlatformNATSURL) == "" {
+		log.Printf("PLATFORM_NATS_URL is not configured; WA platform events are disabled")
+		return nil, nil
+	}
 	return natseventbus.ConnectRequired(
 		natseventbus.Config{URL: cfg.PlatformNATSURL, ClientName: "wa-app-service"},
-		"PLATFORM_NATS_URL is required for WA platform events",
+		"connect WA platform events",
 	)
 }

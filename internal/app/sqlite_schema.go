@@ -1,0 +1,164 @@
+package app
+
+const sqliteStoreSchema = `
+CREATE TABLE IF NOT EXISTS wa_sqlite_artifacts (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wa_sqlite_protocol_profiles (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wa_sqlite_accounts (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  e164 TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  UNIQUE(workspace_id, e164)
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_accounts_workspace_updated ON wa_sqlite_accounts(workspace_id, updated_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS wa_sqlite_client_profiles (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  wa_account_id TEXT NOT NULL,
+  protocol_profile_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_client_profiles_account ON wa_sqlite_client_profiles(workspace_id, wa_account_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_native_states (
+  workspace_id TEXT NOT NULL,
+  client_profile_id TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, client_profile_id)
+);
+CREATE TABLE IF NOT EXISTS wa_sqlite_account_probes (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  wa_account_id TEXT NOT NULL DEFAULT '',
+  client_profile_id TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_account_probes_account ON wa_sqlite_account_probes(workspace_id, wa_account_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_verification_requests (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  wa_account_id TEXT NOT NULL,
+  client_profile_id TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_verification_account ON wa_sqlite_verification_requests(workspace_id, wa_account_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_registrations (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  verification_request_id TEXT NOT NULL,
+  wa_account_id TEXT NOT NULL,
+  client_profile_id TEXT NOT NULL,
+  submitted_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_registrations_account ON wa_sqlite_registrations(workspace_id, wa_account_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_login_states (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  registration_id TEXT NOT NULL,
+  wa_account_id TEXT NOT NULL,
+  client_profile_id TEXT NOT NULL,
+  registered_identity_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  UNIQUE(workspace_id, registration_id),
+  UNIQUE(workspace_id, registered_identity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_login_active ON wa_sqlite_login_states(workspace_id, wa_account_id, client_profile_id, status);
+CREATE TABLE IF NOT EXISTS wa_sqlite_message_sessions (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  wa_account_id TEXT NOT NULL,
+  client_profile_id TEXT NOT NULL,
+  registered_identity_id TEXT NOT NULL,
+  protocol_profile_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_message_sessions_account ON wa_sqlite_message_sessions(workspace_id, wa_account_id, client_profile_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_inbound_messages (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  message_session_id TEXT NOT NULL,
+  encryption_state TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_inbound_session ON wa_sqlite_inbound_messages(workspace_id, message_session_id, received_at);
+CREATE TABLE IF NOT EXISTS wa_sqlite_decrypted_messages (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  decrypted_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_decrypted_message ON wa_sqlite_decrypted_messages(workspace_id, message_id);
+CREATE TABLE IF NOT EXISTS wa_sqlite_candidates (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  decrypted_message_id TEXT NOT NULL,
+  extracted_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wa_sqlite_otp_messages (
+  workspace_id TEXT NOT NULL,
+  id TEXT PRIMARY KEY,
+  wa_account_id TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_otp_account ON wa_sqlite_otp_messages(workspace_id, wa_account_id, received_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS wa_sqlite_runtime_state (
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value BLOB NOT NULL DEFAULT x'',
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_wa_sqlite_runtime_expires ON wa_sqlite_runtime_state(expires_at);
+`
+
+var sqliteDeleteWAAccountStatements = []string{
+	`DELETE FROM wa_sqlite_otp_messages WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_candidates WHERE workspace_id=? AND message_id IN (
+  SELECT m.id FROM wa_sqlite_inbound_messages m
+  JOIN wa_sqlite_message_sessions s ON s.workspace_id=m.workspace_id AND s.id=m.message_session_id
+  WHERE s.workspace_id=? AND s.wa_account_id=?
+)`,
+	`DELETE FROM wa_sqlite_decrypted_messages WHERE workspace_id=? AND message_id IN (
+  SELECT m.id FROM wa_sqlite_inbound_messages m
+  JOIN wa_sqlite_message_sessions s ON s.workspace_id=m.workspace_id AND s.id=m.message_session_id
+  WHERE s.workspace_id=? AND s.wa_account_id=?
+)`,
+	`DELETE FROM wa_sqlite_inbound_messages WHERE workspace_id=? AND message_session_id IN (
+  SELECT id FROM wa_sqlite_message_sessions WHERE workspace_id=? AND wa_account_id=?
+)`,
+	`DELETE FROM wa_sqlite_message_sessions WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_login_states WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_registrations WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_verification_requests WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_account_probes WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_native_states WHERE workspace_id=? AND client_profile_id IN (
+  SELECT id FROM wa_sqlite_client_profiles WHERE workspace_id=? AND wa_account_id=?
+)`,
+	`DELETE FROM wa_sqlite_client_profiles WHERE workspace_id=? AND wa_account_id=?`,
+	`DELETE FROM wa_sqlite_accounts WHERE workspace_id=? AND id=?`,
+}

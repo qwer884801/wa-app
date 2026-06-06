@@ -2,9 +2,8 @@ import path from 'path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
-import { federation } from '@module-federation/vite';
 
-const linkedPeerAliases = [
+const linkedAliases = [
   { find: /^@tanstack\/react-query$/, replacement: path.resolve(__dirname, 'node_modules/@tanstack/react-query') },
   { find: /^class-variance-authority$/, replacement: path.resolve(__dirname, 'node_modules/class-variance-authority') },
   { find: /^clsx$/, replacement: path.resolve(__dirname, 'node_modules/clsx') },
@@ -20,22 +19,8 @@ const linkedPeerAliases = [
 ];
 
 export default defineConfig({
-  base: '/mf/wa/',
-  plugins: [
-    react(),
-    tailwindcss(),
-    federation({
-      name: 'wa_app',
-      filename: 'remoteEntry.js',
-      exposes: { './dashboardModule': './src/dashboard/manifest.tsx' },
-      shared: {
-        react: { singleton: true },
-        'react-dom': { singleton: true },
-        '@tanstack/react-query': { singleton: true },
-        '@byte-v-forge/common-ui': { singleton: true }
-      }
-    })
-  ],
-  resolve: { preserveSymlinks: true, alias: [...linkedPeerAliases, { find: '@', replacement: path.resolve(__dirname, './src') }] },
-  build: { target: 'esnext', modulePreload: false, cssCodeSplit: true, rollupOptions: { input: path.resolve(__dirname, './src/remote-entry.ts') } }
+  base: '/',
+  plugins: [react(), tailwindcss()],
+  resolve: { preserveSymlinks: true, alias: [...linkedAliases, { find: '@', replacement: path.resolve(__dirname, './src') }] },
+  build: { target: 'esnext', modulePreload: false, cssCodeSplit: true }
 });

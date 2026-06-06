@@ -18,7 +18,8 @@ import (
 )
 
 const transientStateTTL = 30 * time.Minute
-const registrationOTPWaitDefaultTTL = 10 * time.Minute
+const registrationOTPWaitDefaultTTL = 20 * time.Minute
+const registrationProxyLeaseTTL = 10 * time.Minute
 
 type registrationOTPWait struct {
 	WorkspaceID           string `json:"workspace_id"`
@@ -26,6 +27,14 @@ type registrationOTPWait struct {
 	VerificationRequestID string `json:"verification_request_id"`
 	ResumeURL             string `json:"resume_url"`
 	CreatedAtUnix         int64  `json:"created_at_unix"`
+}
+
+type registrationProxyLeaseState struct {
+	AccountID     string `json:"account_id"`
+	LeaseID       string `json:"lease_id"`
+	ProxyURL      string `json:"proxy_url"`
+	CreatedAtUnix int64  `json:"created_at_unix"`
+	ExpiresAtUnix int64  `json:"expires_at_unix"`
 }
 
 type actionGateway struct{ server *Server }
@@ -81,7 +90,7 @@ func (g *actionGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (g *actionGateway) proxySettings(payload map[string]any) (map[string]any, error) {
 	_ = payload
-	return map[string]any{"success": true, "proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US", "preflight": false}, nil
+	return map[string]any{"success": true, "proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US", "preflight": false}, nil
 }
 
 func (g *actionGateway) generateTransientFingerprint(ctx context.Context, payload map[string]any) (map[string]any, error) {
@@ -145,7 +154,7 @@ func (g *actionGateway) commitFingerprint(ctx context.Context, payload map[strin
 }
 
 func (g *actionGateway) requestSMSOTP(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	runner, err := g.nativeEngineForPayload(payload)
+	runner, lease, managedLease, err := g.registrationRequestRunner(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -157,18 +166,32 @@ func (g *actionGateway) requestSMSOTP(ctx context.Context, payload map[string]an
 		ProtocolProfileId: textField(payload, "protocol_profile_id"),
 		DeliveryMethod:    waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS,
 	}, runner)
+	runner.CloseIdleConnections()
 	if err != nil {
+		if managedLease {
+			g.releaseDynamicLease(context.Background(), lease)
+		}
 		return nil, err
 	}
 	if resp.GetError() != nil {
+		if managedLease {
+			g.releaseDynamicLease(context.Background(), lease)
+		}
 		return map[string]any{"success": false, "error": protoMap(resp.GetError()), "error_message": resp.GetError().GetMessage()}, nil
 	}
 	record := resp.GetVerificationRequest()
+	if managedLease {
+		if err := g.saveRegistrationProxyLease(ctx, reqCtx.GetWorkspaceId(), record.GetVerificationRequestId(), lease); err != nil {
+			g.releaseDynamicLease(context.Background(), lease)
+			return nil, err
+		}
+	}
 	return map[string]any{
 		"success":                 record.GetStatus() == waappv1.VerificationRequestStatus_VERIFICATION_REQUEST_STATUS_SENT || record.GetStatus() == waappv1.VerificationRequestStatus_VERIFICATION_REQUEST_STATUS_WAITING,
 		"status":                  record.GetStatus().String(),
 		"verification_request_id": record.GetVerificationRequestId(),
 		"verification_request":    protoMap(record),
+		"proxy":                   registrationProxyLeaseMap(lease, managedLease),
 	}, nil
 }
 
@@ -197,11 +220,24 @@ func (g *actionGateway) resumeOTP(ctx context.Context, payload map[string]any) (
 	if err != nil {
 		return nil, err
 	}
-	if err := postRegistrationOTPResume(ctx, wait, code); err != nil {
+	if wait.ResumeURL != "" {
+		if err := postRegistrationOTPResume(ctx, wait, code); err != nil {
+			return nil, err
+		}
+		_ = g.deleteRegistrationOTPWait(ctx, wait)
+		return map[string]any{"success": true, "wa_account_id": wait.WAAccountID, "verification_request_id": wait.VerificationRequestID}, nil
+	}
+	submitPayload := cloneActionPayload(payload)
+	submitPayload["verification_request_id"] = wait.VerificationRequestID
+	submitPayload["code"] = code
+	result, err := g.submitOTP(ctx, submitPayload)
+	if err != nil {
 		return nil, err
 	}
-	_ = g.deleteRegistrationOTPWait(ctx, wait)
-	return map[string]any{"success": true, "wa_account_id": wait.WAAccountID, "verification_request_id": wait.VerificationRequestID}, nil
+	if result["success"] == true {
+		_ = g.deleteRegistrationOTPWait(ctx, wait)
+	}
+	return result, nil
 }
 
 func registrationOTPWaitFromPayload(payload map[string]any) (registrationOTPWait, time.Duration, error) {
@@ -221,9 +257,6 @@ func registrationOTPWaitFromPayload(payload map[string]any) (registrationOTPWait
 			return registrationOTPWait{}, 0, err
 		}
 		wait.WAAccountID = accountID
-	}
-	if wait.ResumeURL == "" {
-		return registrationOTPWait{}, 0, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "resume_url is required", false)
 	}
 	ttl := time.Duration(numberField(payload, "timeout_seconds")) * time.Second
 	if ttl <= 0 {
@@ -318,7 +351,7 @@ func registrationOTPWaitAccountKey(workspaceID string, waAccountIDValue string) 
 }
 
 func (g *actionGateway) submitOTP(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	runner, err := g.nativeEngineForPayload(payload)
+	runner, lease, managedLease, err := g.registrationSubmitRunner(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -327,17 +360,32 @@ func (g *actionGateway) submitOTP(ctx context.Context, payload map[string]any) (
 		VerificationRequestId: textField(payload, "verification_request_id"),
 		SubmittedCode:         &waappv1.SubmitVerificationCodeRequest_Code{Code: textField(payload, "code")},
 	}, runner)
+	runner.CloseIdleConnections()
 	if err != nil {
+		if managedLease {
+			g.releaseDynamicLease(context.Background(), lease)
+			_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+		}
 		return nil, err
 	}
 	if resp.GetError() != nil {
+		if managedLease {
+			g.releaseDynamicLease(context.Background(), lease)
+			_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+		}
 		return map[string]any{"success": false, "error": protoMap(resp.GetError()), "error_message": resp.GetError().GetMessage(), "registration": protoMap(resp.GetRegistration())}, nil
 	}
+	success := resp.GetRegistration().GetStatus() == waappv1.RegistrationStatus_REGISTRATION_STATUS_REGISTERED && resp.GetLoginState().GetStatus() == waappv1.LoginStateStatus_LOGIN_STATE_STATUS_ACTIVE
+	if managedLease {
+		g.releaseDynamicLease(context.Background(), lease)
+		_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+	}
 	return map[string]any{
-		"success":      resp.GetRegistration().GetStatus() == waappv1.RegistrationStatus_REGISTRATION_STATUS_REGISTERED && resp.GetLoginState().GetStatus() == waappv1.LoginStateStatus_LOGIN_STATE_STATUS_ACTIVE,
+		"success":      success,
 		"status":       resp.GetRegistration().GetStatus().String(),
 		"registration": protoMap(resp.GetRegistration()),
 		"login_state":  protoMap(resp.GetLoginState()),
+		"proxy":        registrationProxyLeaseMap(lease, managedLease),
 	}, nil
 }
 
@@ -351,6 +399,7 @@ func (g *actionGateway) cleanupFailedRegistration(ctx context.Context, payload m
 			WAAccountID:           accountID,
 			VerificationRequestID: verificationRequestID,
 		})
+		_ = g.releaseRegistrationProxyLease(ctx, reqCtx.GetWorkspaceId(), verificationRequestID)
 	}
 	if accountID == "" {
 		return map[string]any{"success": true, "deleted": false, "reason": "missing_wa_account_id"}, nil
@@ -439,7 +488,7 @@ func (g *actionGateway) checkLoginState(ctx context.Context, payload map[string]
 }
 
 func (s *Server) commitNativeState(ctx context.Context, reqCtx *waappv1.RequestContext, phone *waappv1.PhoneTarget, state nativeState) (*waappv1.WAAccount, *waappv1.ClientProfile, *waappv1.ProtocolProfile, error) {
-	engine, ok := s.runner.(*NativeEngine)
+	engine, ok := s.runner.(nativeStateSaver)
 	if !ok {
 		return nil, nil, nil, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_UNSUPPORTED_OPERATION, "native engine is required", false)
 	}
@@ -481,6 +530,10 @@ func (s *Server) commitNativeState(ctx context.Context, reqCtx *waappv1.RequestC
 		return nil, nil, nil, err
 	}
 	return account, profile, protocol, nil
+}
+
+type nativeStateSaver interface {
+	saveState(context.Context, string, string, nativeState) error
 }
 
 func (s *Server) ensureDefaultProtocolProfile(ctx context.Context, workspaceID string) (*waappv1.ProtocolProfile, error) {
@@ -528,6 +581,172 @@ func (g *actionGateway) nativeEngineForPayload(payload map[string]any) (*NativeE
 		return engine, nil
 	}
 	return engine.WithProxyURL(proxyURL)
+}
+
+func (g *actionGateway) registrationRequestRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyLease, bool, error) {
+	engine, err := g.nativeEngineForPayload(payload)
+	if err != nil {
+		return nil, DynamicProxyLease{}, false, err
+	}
+	if actionProxyURL(payload) != "" {
+		return engine, DynamicProxyLease{}, false, nil
+	}
+	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
+		return engine, DynamicProxyLease{}, false, nil
+	}
+	lease, err := g.acquireRegistrationStickyProxy(ctx, payload, "WA_REGISTRATION_REQUEST_SMS")
+	if err != nil {
+		return engine, DynamicProxyLease{}, false, nil
+	}
+	proxied, err := engine.WithProxyURL(lease.ProxyURL)
+	if err != nil {
+		g.releaseDynamicLease(context.Background(), lease)
+		return nil, DynamicProxyLease{}, false, err
+	}
+	return proxied, lease, true, nil
+}
+
+func (g *actionGateway) registrationSubmitRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyLease, bool, error) {
+	engine, err := g.nativeEngineForPayload(payload)
+	if err != nil {
+		return nil, DynamicProxyLease{}, false, err
+	}
+	if actionProxyURL(payload) != "" {
+		return engine, DynamicProxyLease{}, false, nil
+	}
+	workspaceID := actionContext(payload).GetWorkspaceId()
+	verificationRequestID := textField(payload, "verification_request_id")
+	lease, err := g.loadRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+	if err == nil && registrationProxyLeaseExpired(lease, time.Now().UTC()) {
+		g.releaseDynamicLease(context.Background(), lease)
+		_ = g.deleteRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+		err = NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "registration proxy session expired", false)
+	}
+	if err != nil {
+		if g == nil || g.server == nil || g.server.proxyRuntime == nil {
+			return engine, DynamicProxyLease{}, false, nil
+		}
+		lease, err = g.acquireRegistrationStickyProxy(ctx, payload, "WA_REGISTRATION_SUBMIT_OTP")
+		if err != nil {
+			return engine, DynamicProxyLease{}, false, nil
+		}
+		if saveErr := g.saveRegistrationProxyLease(ctx, workspaceID, verificationRequestID, lease); saveErr != nil {
+			g.releaseDynamicLease(context.Background(), lease)
+			return nil, DynamicProxyLease{}, false, saveErr
+		}
+	}
+	proxied, err := engine.WithProxyURL(lease.ProxyURL)
+	if err != nil {
+		g.releaseDynamicLease(context.Background(), lease)
+		return nil, DynamicProxyLease{}, false, err
+	}
+	return proxied, lease, true, nil
+}
+
+func (g *actionGateway) acquireRegistrationStickyProxy(ctx context.Context, payload map[string]any, purpose string) (DynamicProxyLease, error) {
+	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
+		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "PROXY_RUNTIME_API_BASE_URL is required", false)
+	}
+	return g.server.proxyRuntime.AcquireUSDynamicLease(ctx, DynamicProxyLeaseRequest{
+		Purpose:       purpose,
+		CorrelationID: firstNonEmpty(textField(payload, "job_id"), textField(payload, "request_id"), textField(payload, "verification_request_id")),
+		TTL:           registrationProxyLeaseTTL,
+		Mode:          DynamicProxySessionModeSticky,
+	})
+}
+
+func (g *actionGateway) saveRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string, lease DynamicProxyLease) error {
+	if strings.TrimSpace(verificationRequestID) == "" || strings.TrimSpace(lease.ProxyURL) == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	expiresAt := lease.ExpiresAt
+	if expiresAt.IsZero() {
+		expiresAt = now.Add(registrationProxyLeaseTTL)
+	}
+	data, err := json.Marshal(registrationProxyLeaseState{
+		AccountID:     lease.AccountID,
+		LeaseID:       lease.LeaseID,
+		ProxyURL:      lease.ProxyURL,
+		CreatedAtUnix: now.Unix(),
+		ExpiresAtUnix: expiresAt.UTC().Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	return g.server.runtime.SaveTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID), data, registrationOTPWaitDefaultTTL)
+}
+
+func (g *actionGateway) loadRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) (DynamicProxyLease, error) {
+	if strings.TrimSpace(verificationRequestID) == "" {
+		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "verification_request_id is required", false)
+	}
+	data, err := g.server.runtime.GetTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID))
+	if err != nil {
+		return DynamicProxyLease{}, err
+	}
+	var state registrationProxyLeaseState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return DynamicProxyLease{}, err
+	}
+	if strings.TrimSpace(state.ProxyURL) == "" {
+		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "registration proxy lease is missing proxy_url", false)
+	}
+	lease := DynamicProxyLease{AccountID: state.AccountID, LeaseID: state.LeaseID, ProxyURL: state.ProxyURL}
+	if state.ExpiresAtUnix > 0 {
+		lease.ExpiresAt = time.Unix(state.ExpiresAtUnix, 0).UTC()
+	}
+	return lease, nil
+}
+
+func (g *actionGateway) releaseRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) error {
+	if strings.TrimSpace(verificationRequestID) == "" {
+		return nil
+	}
+	lease, err := g.loadRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+	if err == nil {
+		g.releaseDynamicLease(context.Background(), lease)
+	}
+	return g.deleteRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+}
+
+func (g *actionGateway) releaseDynamicLease(ctx context.Context, lease DynamicProxyLease) {
+	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
+		return
+	}
+	g.server.proxyRuntime.ReleaseLease(ctx, lease)
+}
+
+func (g *actionGateway) deleteRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) error {
+	if strings.TrimSpace(verificationRequestID) == "" {
+		return nil
+	}
+	return g.server.runtime.DeleteTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID))
+}
+
+func registrationProxyLeaseKey(workspaceID string, verificationRequestID string) string {
+	return "wa-registration-proxy-lease:verification:" + workspaceID + ":" + verificationRequestID
+}
+
+func registrationProxyLeaseExpired(lease DynamicProxyLease, now time.Time) bool {
+	return !lease.ExpiresAt.IsZero() && !lease.ExpiresAt.After(now)
+}
+
+func registrationProxyLeaseMap(lease DynamicProxyLease, managed bool) map[string]any {
+	if !managed {
+		return map[string]any{}
+	}
+	result := map[string]any{
+		"proxy_mode":   "US_STICKY_DYNAMIC_IP",
+		"country_code": "US",
+		"account_id":   lease.AccountID,
+		"lease_id":     lease.LeaseID,
+		"proxy_url":    lease.ProxyURL,
+	}
+	if !lease.ExpiresAt.IsZero() {
+		result["expires_at"] = lease.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return result
 }
 
 func actionProxyURL(payload map[string]any) string {

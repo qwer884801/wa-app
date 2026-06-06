@@ -14,6 +14,7 @@ type Config struct {
 	PlatformNATSURL             string
 	PGDSN                       string
 	RedisURL                    string
+	DataDir                     string
 }
 
 func Load() Config {
@@ -27,5 +28,6 @@ func Load() Config {
 		PlatformNATSURL:             envx.StringDefault("PLATFORM_NATS_URL", ""),
 		PGDSN:                       envx.StringDefault("WA_APP_PG_DSN", ""),
 		RedisURL:                    envx.StringDefault("PLATFORM_REDIS_URL", ""),
+		DataDir:                     envx.StringDefault("WA_APP_DATA_DIR", "/var/lib/wa-app"),
 	}
 }

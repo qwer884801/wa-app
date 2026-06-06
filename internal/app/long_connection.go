@@ -341,19 +341,19 @@ func (s *Server) longConnectionRunner(ctx context.Context, _ *waappv1.LoginState
 		return newLongConnectionNativeEngine(engine), nil
 	}
 	if s.proxyRuntime == nil {
-		return nil, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "PROXY_RUNTIME_API_BASE_URL is required", false)
+		return newLongConnectionNativeEngine(engine), nil
 	}
 	username := strings.TrimSpace(s.longProxyUsername)
 	if username == "" {
-		return nil, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "WA_LONG_CONNECTION_PROXY_USERNAME is required", false)
+		return newLongConnectionNativeEngine(engine), nil
 	}
 	proxyURL, err := s.proxyRuntime.GatewayProxyURL(ctx, username)
 	if err != nil {
-		return nil, err
+		return newLongConnectionNativeEngine(engine), nil
 	}
 	proxyEngine, err := engine.WithProxyURL(proxyURL)
 	if err != nil {
-		return nil, err
+		return newLongConnectionNativeEngine(engine), nil
 	}
 	return newLongConnectionNativeEngine(proxyEngine), nil
 }

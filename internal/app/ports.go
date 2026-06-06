@@ -58,6 +58,11 @@ type RuntimeState interface {
 	CloseSessionLease(context.Context, string) error
 }
 
+type NativeStateStore interface {
+	SaveNativeState(context.Context, string, string, nativeState) error
+	GetNativeState(context.Context, string, string) (nativeState, error)
+}
+
 type LoginStateRecord struct {
 	WorkspaceID string
 	LoginState  *waappv1.LoginState

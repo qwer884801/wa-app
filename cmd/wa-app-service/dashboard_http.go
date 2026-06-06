@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +30,7 @@ type dashboardHTTP struct {
 	staticDir        string
 	n8nWebhookBase   string
 	proxyRuntimeBase string
+	proxyRuntime     *app.DynamicProxyRuntime
 	client           *http.Client
 	service          *app.Server
 	actionHandler    http.Handler
@@ -44,6 +44,7 @@ func runDashboardHTTP(ctx context.Context, listenAddr, staticDir, n8nWebhookBase
 		staticDir:        firstNonEmpty(staticDir, "/app/dashboard/wa"),
 		n8nWebhookBase:   strings.TrimRight(strings.TrimSpace(n8nWebhookBase), "/"),
 		proxyRuntimeBase: strings.TrimRight(strings.TrimSpace(proxyRuntimeBase), "/"),
+		proxyRuntime:     app.NewDynamicProxyRuntime(proxyRuntimeBase),
 		client:           &http.Client{Timeout: 7 * time.Minute},
 		service:          service,
 		actionHandler:    actionHandler,
@@ -62,8 +63,9 @@ func runDashboardHTTP(ctx context.Context, listenAddr, staticDir, n8nWebhookBase
 	mux.HandleFunc("/api/wa/account-otp-messages", server.handleAccountOTPMessages)
 	mux.HandleFunc("/api/wa/long-connections", server.handleLongConnections)
 	mux.Handle("/api/wa/actions/", server.actionHandler)
-	mux.Handle("/mf/wa/", http.StripPrefix("/mf/wa/", noCacheFileServer(server.staticDir)))
+	mux.HandleFunc("/mf/wa/", http.NotFound)
 	mux.HandleFunc("/healthz", server.handleHealth)
+	mux.Handle("/", standaloneDashboard(server.staticDir))
 	httpServer := &http.Server{Addr: listenAddr, Handler: withCORS(mux), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -235,7 +237,8 @@ func (s *dashboardHTTP) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"ok":                     true,
 		"n8n_webhook_configured": s.n8nWebhookBase != "",
 		"workflows": []map[string]string{
-			{"key": "register", "label": "WA 注册流程", "webhook_path": "wa/register"},
+			{"key": "register-native", "label": "WA 原生注册流程", "webhook_path": "/api/wa/register"},
+			{"key": "register-n8n", "label": "WA n8n 外部编排", "webhook_path": "wa/register"},
 		},
 	})
 }
@@ -275,7 +278,37 @@ func (s *dashboardHTTP) handlePhoneSMSProbe(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *dashboardHTTP) handleRegister(w http.ResponseWriter, r *http.Request) {
-	s.forwardWorkflow(w, r, "wa/register")
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.service == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "wa-app service is not configured"})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	normalized, err := normalizeWorkflowBody(body, "wa-register")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	payload := map[string]any{}
+	if err := json.Unmarshal(normalized, &payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be json"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	result, err := s.service.StartRegistration(ctx, payload)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"success": false, "status": "REGISTRATION_START_FAILED", "error_message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *dashboardHTTP) handleLoginStateCheck(w http.ResponseWriter, r *http.Request) {
@@ -298,15 +331,20 @@ func (s *dashboardHTTP) handleLoginStateCheck(w http.ResponseWriter, r *http.Req
 	payload["workspace_id"] = firstNonEmpty(textField(payload, "workspace_id"), "default")
 	payload["request_id"] = firstNonEmpty(textField(payload, "request_id"), newRequestID("wa-req"))
 	payload["job_id"] = firstNonEmpty(textField(payload, "job_id"), newRequestID("wa-login-state-check"))
-	if textField(payload, "proxy_url") == "" && textField(objectField(payload, "proxy"), "proxy_url") == "" && s.proxyRuntimeBase != "" {
-		lease, err := s.acquireUSDynamicProxy(r.Context(), payload)
+	if textField(payload, "proxy_url") == "" && textField(objectField(payload, "proxy"), "proxy_url") == "" && s.proxyRuntime != nil {
+		lease, err := s.proxyRuntime.AcquireUSDynamicLease(r.Context(), app.DynamicProxyLeaseRequest{
+			Purpose:       "WA_LOGIN_STATE_CHECK",
+			CorrelationID: firstNonEmpty(textField(payload, "job_id"), textField(payload, "request_id")),
+			TTL:           10 * time.Minute,
+			Mode:          app.DynamicProxySessionModeRotating,
+		})
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "status": "US_DYNAMIC_IP_UNAVAILABLE", "error_message": "US random dynamic IP unavailable", "proxy": map[string]string{"proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US"}})
+			writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "status": "US_DYNAMIC_IP_UNAVAILABLE", "error_message": "US rotating dynamic IP unavailable", "proxy": map[string]string{"proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US"}})
 			return
 		}
-		defer s.releaseDynamicProxy(context.Background(), lease.accountID)
-		payload["proxy_url"] = lease.proxyURL
-		payload["proxy"] = map[string]any{"proxy_mode": "US_RANDOM_DYNAMIC_IP", "country_code": "US", "account_id": lease.accountID, "lease_id": lease.leaseID}
+		defer s.proxyRuntime.ReleaseLease(context.Background(), lease)
+		payload["proxy_url"] = lease.ProxyURL
+		payload["proxy"] = map[string]any{"proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US", "account_id": lease.AccountID, "lease_id": lease.LeaseID}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -318,130 +356,6 @@ func (s *dashboardHTTP) handleLoginStateCheck(w http.ResponseWriter, r *http.Req
 	r.ContentLength = int64(len(encoded))
 	r.Header.Set("Content-Type", "application/json")
 	s.actionHandler.ServeHTTP(w, r)
-}
-
-type dynamicProxyLease struct {
-	accountID string
-	leaseID   string
-	proxyURL  string
-}
-
-func (s *dashboardHTTP) acquireUSDynamicProxy(ctx context.Context, payload map[string]any) (dynamicProxyLease, error) {
-	endpoint, err := proxyRuntimeURL(s.proxyRuntimeBase, "/leases/acquire")
-	if err != nil {
-		return dynamicProxyLease{}, err
-	}
-	accountID := firstNonEmpty(textField(payload, "proxy_account_id"), "wa-login-check-"+newRequestID("lease"))
-	requestBody := map[string]any{
-		"account_id": accountID,
-		"purpose":    "WA_LOGIN_STATE_CHECK",
-		"force_new":  true,
-		"policy": map[string]any{
-			"mode":       "PROXY_SESSION_MODE_STICKY",
-			"region":     "US",
-			"sticky_ttl": "600s",
-			"labels": map[string]string{
-				"country_code": "US",
-				"job_id":       textField(payload, "job_id"),
-			},
-		},
-		"route_policy": map[string]any{
-			"country_code":                 "US",
-			"purpose":                      "WA_LOGIN_STATE_CHECK",
-			"strategy":                     "PROXY_SELECTOR_STRATEGY_HASH_TARGET_HOST",
-			"max_attempts":                 1,
-			"allow_direct_dynamic_gateway": true,
-		},
-	}
-	data, _ := json.Marshal(requestBody)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return dynamicProxyLease{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return dynamicProxyLease{}, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return dynamicProxyLease{}, fmt.Errorf("proxy-runtime acquire returned HTTP %d", resp.StatusCode)
-	}
-	raw := map[string]any{}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return dynamicProxyLease{}, err
-	}
-	lease := objectField(raw, "lease")
-	egress := objectField(raw, "egress")
-	if len(egress) == 0 {
-		egress = objectField(lease, "egress")
-	}
-	proxyURL, err := proxyURLFromEndpoint(s.proxyRuntimeBase, egress)
-	if err != nil {
-		return dynamicProxyLease{}, err
-	}
-	return dynamicProxyLease{accountID: firstNonEmpty(textField(lease, "account_id"), accountID), leaseID: textField(lease, "lease_id"), proxyURL: proxyURL}, nil
-}
-
-func (s *dashboardHTTP) releaseDynamicProxy(ctx context.Context, accountID string) {
-	if strings.TrimSpace(accountID) == "" {
-		return
-	}
-	endpoint, err := proxyRuntimeURL(s.proxyRuntimeBase, "/leases/release")
-	if err != nil {
-		return
-	}
-	data, _ := json.Marshal(map[string]string{"account_id": accountID})
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
-	if err == nil && resp != nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-		_ = resp.Body.Close()
-	}
-}
-
-func (s *dashboardHTTP) forwardWorkflow(w http.ResponseWriter, r *http.Request, path string) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
-		return
-	}
-	if s.n8nWebhookBase == "" {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "WA_N8N_WEBHOOK_BASE_URL is required"})
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
-	normalized, err := normalizeWorkflowBody(body, path)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	url := s.n8nWebhookBase + "/" + strings.TrimLeft(path, "/")
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(normalized))
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "build workflow request failed"})
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "workflow request failed"})
-		return
-	}
-	defer resp.Body.Close()
-	copyHeader(w.Header(), resp.Header, "Content-Type")
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
 var nonDigits = regexp.MustCompile(`\D+`)
@@ -565,66 +479,6 @@ func objectField(data map[string]any, key string) map[string]any {
 	return map[string]any{}
 }
 
-func proxyRuntimeURL(baseURL string, path string) (string, error) {
-	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
-	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String(), nil
-}
-
-func proxyURLFromEndpoint(baseURL string, endpoint map[string]any) (string, error) {
-	port := int(numberField(endpoint, "port"))
-	if port <= 0 {
-		return "", fmt.Errorf("dynamic proxy lease has no egress port")
-	}
-	protocol := strings.ToUpper(textField(endpoint, "protocol"))
-	scheme := "http"
-	if strings.Contains(protocol, "SOCKS5") {
-		scheme = "socks5"
-	}
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-	host := textField(endpoint, "host")
-	if isLocalProxyHost(host) {
-		host = base.Hostname()
-	}
-	if host == "" {
-		return "", fmt.Errorf("dynamic proxy lease has no egress host")
-	}
-	return (&url.URL{Scheme: scheme, Host: net.JoinHostPort(host, fmt.Sprintf("%d", port))}).String(), nil
-}
-
-func isLocalProxyHost(host string) bool {
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	return host == "" || host == "0.0.0.0" || host == "127.0.0.1" || host == "localhost" || host == "::" || host == "::1"
-}
-
-func numberField(data map[string]any, key string) int64 {
-	value, ok := data[key]
-	if !ok || value == nil {
-		return 0
-	}
-	switch typed := value.(type) {
-	case json.Number:
-		n, _ := typed.Int64()
-		return n
-	case float64:
-		return int64(typed)
-	case string:
-		var n int64
-		_, _ = fmt.Sscan(typed, &n)
-		return n
-	default:
-		return 0
-	}
-}
-
 func newRequestID(prefix string) string {
 	var random [4]byte
 	if _, err := rand.Read(random[:]); err != nil {
@@ -663,12 +517,6 @@ func methodNotAllowed(w http.ResponseWriter, allowed string) {
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 }
 
-func copyHeader(dst, src http.Header, key string) {
-	if value := src.Get(key); value != "" {
-		dst.Set(key, value)
-	}
-}
-
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -682,7 +530,18 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func noCacheFileServer(dir string) http.Handler {
+func standaloneDashboard(dir string) http.Handler {
+	files := spaFileServer(dir)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dashboard/wa" || strings.HasPrefix(r.URL.Path, "/dashboard/wa/") {
+			http.Redirect(w, r, "/", http.StatusMovedPermanently)
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
+}
+
+func spaFileServer(dir string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		path := filepath.Join(dir, filepath.Clean(r.URL.Path))
@@ -690,7 +549,7 @@ func noCacheFileServer(dir string) http.Handler {
 			http.ServeFile(w, r, path)
 			return
 		}
-		http.NotFound(w, r)
+		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
 	})
 }
 

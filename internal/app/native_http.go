@@ -24,8 +24,15 @@ type nativeHTTPClient struct {
 	client *http.Client
 }
 
+func (c *nativeHTTPClient) CloseIdleConnections() {
+	if c == nil || c.client == nil {
+		return
+	}
+	c.client.CloseIdleConnections()
+}
+
 func newNativeHTTPClient(proxy string) (*nativeHTTPClient, error) {
-	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	transport := &http.Transport{DisableKeepAlives: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	if proxy != "" {
 		parsed, err := proxyURL(proxy)
 		if err != nil {

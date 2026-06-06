@@ -54,6 +54,11 @@ func (s *Server) SetLongConnectionProxyUsername(username string) {
 }
 
 func (s *Server) SetPlatformPublisher(publisher eventbus.Publisher) {
+	if publisher == nil {
+		s.platformPublisher = nil
+		s.accountPublisher = nil
+		return
+	}
 	s.platformPublisher = publisher
 	s.accountPublisher = accountevent.NewPublisher(accountevent.Config{Publisher: publisher, Descriptor: waAccountDescriptor})
 }

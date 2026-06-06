@@ -54,7 +54,9 @@ export function resultStatus(result?: WaWorkflowResponse | null) {
 export function proxyArea(result?: WaWorkflowResponse | null) {
   const proxy = result?.proxy || {};
   const mode = text(proxy.proxy_mode);
-  if (mode === 'US_RANDOM_DYNAMIC_IP') return '美国随机动态 IP';
+  if (mode === 'US_ROTATING_DYNAMIC_IP' || mode === 'US_RANDOM_DYNAMIC_IP') return '美国轮转动态 IP';
+  if (mode === 'US_STICKY_DYNAMIC_IP') return '美国粘性动态 IP';
+  if (mode === 'DIRECT') return '直连';
   return mode || '-';
 }
 

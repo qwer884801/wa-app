@@ -44,8 +44,7 @@ func (s *Server) requestVerificationCode(ctx context.Context, req *waappv1.Reque
 		method = waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS
 	}
 	result := runner.RequestVerificationCode(ctx, EngineRegistrationInput{WorkspaceID: workspaceID, WAAccountID: waAccountID(account), ClientProfileID: profile.GetClientProfileId(), ProtocolProfileID: req.GetProtocolProfileId(), Phone: account.GetPhone()})
-	now := s.clock.Now()
-	record := &waappv1.VerificationCodeRequestRecord{VerificationRequestId: s.ids.NewID("wavrf_"), WaAccountId: waAccountID(account), ClientProfileId: profile.GetClientProfileId(), DeliveryMethod: method, Status: result.Status, ExpectedCodeLength: result.ExpectedCodeLength, RequestedAt: timestamppb.New(now), ExpiresAt: timestamp(result.ExpiresAt), LastError: ToProtoError(result.Err)}
+	record := s.newVerificationCodeRequestRecord(account, profile, method, result)
 	if err := s.store.SaveVerificationRequest(ctx, record, workspaceID); err != nil {
 		return &waappv1.RequestVerificationCodeResponse{Error: ToProtoError(err)}, nil
 	}
@@ -272,4 +271,19 @@ func defaultExpiry(now time.Time, expiresAt *timestamppb.Timestamp) *timestamppb
 		return expiresAt
 	}
 	return timestamppb.New(now.Add(10 * time.Minute))
+}
+
+func (s *Server) newVerificationCodeRequestRecord(account *waappv1.WAAccount, profile *waappv1.ClientProfile, method waappv1.VerificationDeliveryMethod, result EngineCodeResult) *waappv1.VerificationCodeRequestRecord {
+	now := s.clock.Now()
+	return &waappv1.VerificationCodeRequestRecord{
+		VerificationRequestId: s.ids.NewID("wavrf_"),
+		WaAccountId:           waAccountID(account),
+		ClientProfileId:       profile.GetClientProfileId(),
+		DeliveryMethod:        method,
+		Status:                result.Status,
+		ExpectedCodeLength:    result.ExpectedCodeLength,
+		RequestedAt:           timestamppb.New(now),
+		ExpiresAt:             defaultExpiry(now, timestamp(result.ExpiresAt)),
+		LastError:             ToProtoError(result.Err),
+	}
 }
