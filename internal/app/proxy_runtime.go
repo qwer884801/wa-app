@@ -9,21 +9,23 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	proxyruntimev1 "github.com/byte-v-forge/common-lib/gen/go/byte/v/forge/contracts/proxyruntime/v1"
 	"github.com/byte-v-forge/common-lib/protojsonx"
 	waappv1 "github.com/byte-v-forge/wa-app/gen/go/byte/v/forge/waapp/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-type DynamicProxyLease struct {
-	AccountID string
-	LeaseID   string
-	ProxyURL  string
-	ExpiresAt time.Time
+type DynamicProxyRoute struct {
+	AccountID   string
+	RouteID     string
+	Username    string
+	ProfileID   string
+	ProxyURL    string
+	ProxyMode   string
+	CountryCode string
+	ExpiresAt   time.Time
 }
 
 type DynamicProxySessionMode string
@@ -33,7 +35,7 @@ const (
 	DynamicProxySessionModeSticky   DynamicProxySessionMode = "sticky"
 )
 
-type DynamicProxyLeaseRequest struct {
+type DynamicProxyRouteRequest struct {
 	Purpose       string
 	CorrelationID string
 	TTL           time.Duration
@@ -41,142 +43,132 @@ type DynamicProxyLeaseRequest struct {
 }
 
 type DynamicProxyRuntime struct {
-	baseURL string
-	client  *http.Client
+	baseURL       string
+	gatewayScheme string
+	client        *http.Client
+}
+
+type gatewayProxyRule struct {
+	Username  string
+	Password  string
+	ProfileID string
 }
 
 const proxyRuntimeGatewayPort = "10810"
 
-func NewDynamicProxyRuntime(baseURL string) *DynamicProxyRuntime {
+func NewDynamicProxyRuntime(baseURL string, gatewayProtocol string) *DynamicProxyRuntime {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		return nil
 	}
-	return &DynamicProxyRuntime{baseURL: baseURL, client: &http.Client{Timeout: 20 * time.Second}}
+	return &DynamicProxyRuntime{baseURL: baseURL, gatewayScheme: gatewayProxyScheme(gatewayProtocol), client: &http.Client{Timeout: 20 * time.Second}}
 }
 
-func (p *DynamicProxyRuntime) AcquireUSDynamicLease(ctx context.Context, leaseReq DynamicProxyLeaseRequest) (DynamicProxyLease, error) {
-	if p == nil || p.baseURL == "" {
-		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "PROXY_RUNTIME_API_BASE_URL is required", false)
-	}
-	endpoint, err := p.endpoint("/leases/acquire")
+func (p *DynamicProxyRuntime) GatewayProxyRoute(ctx context.Context, username string, routeReq DynamicProxyRouteRequest) (DynamicProxyRoute, error) {
+	rule, err := p.gatewayProxyRule(ctx, username)
 	if err != nil {
-		return DynamicProxyLease{}, err
+		return DynamicProxyRoute{}, err
 	}
-	purpose := firstNonEmpty(leaseReq.Purpose, "WA_DYNAMIC_PROXY")
-	requestBody := &proxyruntimev1.AcquireProxyLeaseRequest{
-		AccountId:       proxyLeaseAccountID(purpose, leaseReq.CorrelationID),
-		Purpose:         purpose,
-		ForceNew:        true,
-		Policy:          proxyLeaseSessionPolicy(leaseReq),
-		SelectionPolicy: &proxyruntimev1.ProxyDynamicIPSelectionPolicy{CountryCode: "US", Purpose: purpose, MaxAttempts: 10},
-	}
-	data, err := protojsonx.Marshal(requestBody)
+	proxyURL, err := p.gatewayProxyURL(rule.Username, rule.Password)
 	if err != nil {
-		return DynamicProxyLease{}, err
+		return DynamicProxyRoute{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	now := time.Now().UTC()
+	expiresAt := time.Time{}
+	if routeReq.TTL > 0 {
+		expiresAt = now.Add(routeReq.TTL)
+	}
+	routeID := proxyRouteID(rule.Username, routeReq)
+	accountID := routeID
+	return DynamicProxyRoute{
+		AccountID:   accountID,
+		RouteID:     routeID,
+		Username:    rule.Username,
+		ProfileID:   rule.ProfileID,
+		ProxyURL:    proxyURL,
+		ProxyMode:   proxyRouteMode(routeReq.Mode),
+		CountryCode: "US",
+		ExpiresAt:   expiresAt,
+	}, nil
+}
+
+func (p *DynamicProxyRuntime) GatewayProxyURL(ctx context.Context, username string) (string, error) {
+	rule, err := p.gatewayProxyRule(ctx, username)
 	if err != nil {
-		return DynamicProxyLease{}, err
+		return "", err
+	}
+	return p.gatewayProxyURL(rule.Username, rule.Password)
+}
+
+func (p *DynamicProxyRuntime) ReleaseProxyRoute(ctx context.Context, route DynamicProxyRoute) error {
+	routeID := strings.TrimSpace(route.RouteID)
+	if p == nil || p.baseURL == "" || !strings.HasPrefix(routeID, "dynamic-profile-") {
+		return nil
+	}
+	endpoint, err := p.endpoint("/leases/release")
+	if err != nil {
+		return err
+	}
+	payload := &proxyruntimev1.ReleaseProxyLeaseRequest{LeaseId: routeID}
+	data, err := protojsonx.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return DynamicProxyLease{}, err
+		return err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return DynamicProxyLease{}, proxyRuntimeRouteError("dynamic lease", resp.StatusCode, body)
+		return proxyRuntimeRouteError("gateway profile release", resp.StatusCode, body)
 	}
-	var acquired proxyruntimev1.AcquireProxyLeaseResponse
-	if err := protojsonx.Unmarshal(body, &acquired); err != nil {
-		return DynamicProxyLease{}, err
-	}
-	lease := acquired.GetLease()
-	egress := acquired.GetEgress()
-	if egress == nil {
-		egress = lease.GetEgress()
-	}
-	proxyURL, err := p.dynamicLeaseProxyURL(egress)
-	if err != nil {
-		return DynamicProxyLease{}, err
-	}
-	expiresAt := time.Time{}
-	if lease.GetExpiresAt() != nil {
-		expiresAt = lease.GetExpiresAt().AsTime()
-	}
-	if expiresAt.IsZero() && leaseReq.TTL > 0 {
-		expiresAt = time.Now().UTC().Add(leaseReq.TTL)
-	}
-	return DynamicProxyLease{AccountID: lease.GetAccountId(), LeaseID: lease.GetLeaseId(), ProxyURL: proxyURL, ExpiresAt: expiresAt}, nil
+	return nil
 }
 
-func (p *DynamicProxyRuntime) GatewayProxyURL(ctx context.Context, username string) (string, error) {
+func (p *DynamicProxyRuntime) gatewayProxyRule(ctx context.Context, username string) (gatewayProxyRule, error) {
 	if p == nil || p.baseURL == "" {
-		return "", NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "PROXY_RUNTIME_API_BASE_URL is required", false)
+		return gatewayProxyRule{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "PROXY_RUNTIME_API_BASE_URL is required", false)
 	}
 	username = strings.TrimSpace(username)
 	if username == "" {
-		return "", NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "gateway username is required", false)
+		return gatewayProxyRule{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "gateway username is required", false)
 	}
 	endpoint, err := p.endpoint("/settings/in-user-rules")
 	if err != nil {
-		return "", err
+		return gatewayProxyRule{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", err
+		return gatewayProxyRule{}, err
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", err
+		return gatewayProxyRule{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", proxyRuntimeRouteError("gateway ingress", resp.StatusCode, body)
+		return gatewayProxyRule{}, proxyRuntimeRouteError("gateway ingress", resp.StatusCode, body)
 	}
 	var settings proxyruntimev1.GetProxyRuntimeSettingsResponse
 	if err := protojsonx.Unmarshal(body, &settings); err != nil {
-		return "", err
+		return gatewayProxyRule{}, err
 	}
 	for _, rule := range settings.GetSettings().GetIngressRules() {
 		if !rule.GetEnabled() || strings.TrimSpace(rule.GetUsername()) != username {
 			continue
 		}
-		return p.gatewayProxyURL(username, rule.GetPasswordValue())
+		return gatewayProxyRule{Username: username, Password: rule.GetPasswordValue(), ProfileID: strings.TrimSpace(rule.GetProfileId())}, nil
 	}
-	return "", NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, fmt.Sprintf("proxy-runtime gateway user %q is unavailable", username), true)
-}
-
-func (p *DynamicProxyRuntime) ReleaseLease(ctx context.Context, lease DynamicProxyLease) {
-	if p == nil || (strings.TrimSpace(lease.LeaseID) == "" && strings.TrimSpace(lease.AccountID) == "") {
-		return
-	}
-	endpoint, err := p.endpoint("/leases/release")
-	if err != nil {
-		return
-	}
-	payload := map[string]string{}
-	if strings.TrimSpace(lease.LeaseID) != "" {
-		payload["lease_id"] = strings.TrimSpace(lease.LeaseID)
-	} else {
-		payload["account_id"] = strings.TrimSpace(lease.AccountID)
-	}
-	data, _ := json.Marshal(payload)
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(req)
-	if err == nil && resp != nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-		_ = resp.Body.Close()
-	}
+	return gatewayProxyRule{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, fmt.Sprintf("proxy-runtime gateway user %q is unavailable", username), true)
 }
 
 func (p *DynamicProxyRuntime) endpoint(path string) (string, error) {
@@ -190,44 +182,55 @@ func (p *DynamicProxyRuntime) endpoint(path string) (string, error) {
 	return parsed.String(), nil
 }
 
-func proxyLeaseSessionPolicy(req DynamicProxyLeaseRequest) *proxyruntimev1.ProxySessionPolicy {
-	policy := &proxyruntimev1.ProxySessionPolicy{
-		Region:       "US",
-		UpstreamKind: proxyruntimev1.ProxyUpstreamKind_PROXY_UPSTREAM_KIND_DYNAMIC_IP,
-		Labels: map[string]string{
-			"country_code": "US",
-			"purpose":      firstNonEmpty(req.Purpose, "WA_DYNAMIC_PROXY"),
-		},
+func (p *DynamicProxyRuntime) gatewayProxyURL(username string, password string) (string, error) {
+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(p.baseURL), "/"))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
 	}
-	if req.CorrelationID != "" {
-		policy.Labels["correlation_id"] = req.CorrelationID
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
 	}
-	switch req.Mode {
-	case DynamicProxySessionModeRotating:
-		policy.Mode = proxyruntimev1.ProxySessionMode_PROXY_SESSION_MODE_ROTATING
-		policy.RotationMode = proxyruntimev1.ProxyRotationMode_PROXY_ROTATION_MODE_PER_REQUEST
-		if req.TTL > 0 {
-			policy.StickyTtl = durationpb.New(req.TTL.Round(time.Second))
-		}
+	gateway := &url.URL{
+		Scheme: p.gatewayScheme,
+		User:   url.UserPassword(username, password),
+		Host:   net.JoinHostPort(host, proxyRuntimeGatewayPort),
+	}
+	return gateway.String(), nil
+}
+
+func gatewayProxyScheme(protocol string) string {
+	protocol = strings.TrimSpace(strings.ToLower(protocol))
+	protocol = strings.TrimSuffix(protocol, "://")
+	switch protocol {
+	case "http", "https", "socks5", "socks5h":
+		return protocol
+	case "mixed":
+		return "http"
+	case "socks", "socks5-proxy":
+		return "socks5"
 	default:
-		policy.Mode = proxyruntimev1.ProxySessionMode_PROXY_SESSION_MODE_STICKY
-		policy.RotationMode = proxyruntimev1.ProxyRotationMode_PROXY_ROTATION_MODE_STICKY_SESSION
-		ttl := req.TTL
-		if ttl <= 0 {
-			ttl = 10 * time.Minute
-		}
-		policy.StickyTtl = durationpb.New(ttl.Round(time.Second))
+		return "socks5"
 	}
-	return policy
 }
 
-func proxyLeaseAccountID(purpose string, correlationID string) string {
-	prefix := safeProxyLeaseToken(firstNonEmpty(purpose, "wa-dynamic-proxy"))
-	seed := strings.Join([]string{purpose, correlationID, strconv.FormatInt(time.Now().UnixNano(), 10)}, ":")
-	return "wa-" + prefix + "-" + stableID(seed)
+func proxyRouteID(username string, req DynamicProxyRouteRequest) string {
+	seed := strings.Join([]string{username, req.Purpose, req.CorrelationID, proxyRouteMode(req.Mode)}, ":")
+	return "gateway-" + safeProxyRouteToken(username) + "-" + stableID(seed)
 }
 
-func safeProxyLeaseToken(value string) string {
+func proxyRouteMode(mode DynamicProxySessionMode) string {
+	switch mode {
+	case DynamicProxySessionModeRotating:
+		return "US_ROTATING_DYNAMIC_IP"
+	case DynamicProxySessionModeSticky:
+		return "US_STICKY_DYNAMIC_IP"
+	default:
+		return "GATEWAY_PROFILE"
+	}
+}
+
+func safeProxyRouteToken(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var out strings.Builder
 	for _, char := range value {
@@ -242,60 +245,12 @@ func safeProxyLeaseToken(value string) string {
 	}
 	token := strings.Trim(out.String(), "-")
 	if token == "" {
-		return "dynamic"
+		return "proxy"
 	}
 	if len(token) > 48 {
 		return token[:48]
 	}
 	return token
-}
-
-func (p *DynamicProxyRuntime) dynamicLeaseProxyURL(endpoint *proxyruntimev1.ProxyEndpoint) (string, error) {
-	if endpoint == nil || endpoint.GetPort() == 0 {
-		return "", fmt.Errorf("proxy-runtime dynamic lease has no egress endpoint")
-	}
-	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(p.baseURL), "/"))
-	if err != nil || base.Scheme == "" || base.Host == "" {
-		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
-	}
-	host := strings.TrimSpace(endpoint.GetHost())
-	if isLocalProxyHost(host) {
-		host = base.Hostname()
-	}
-	if host == "" {
-		return "", fmt.Errorf("proxy-runtime dynamic lease has no egress host")
-	}
-	labels := endpoint.GetLabels()
-	proxyURL := &url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(host, strconv.Itoa(int(endpoint.GetPort()))),
-	}
-	if username := strings.TrimSpace(labels["proxy_username"]); username != "" {
-		proxyURL.User = url.UserPassword(username, labels["proxy_password"])
-	}
-	return proxyURL.String(), nil
-}
-
-func (p *DynamicProxyRuntime) gatewayProxyURL(username string, password string) (string, error) {
-	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(p.baseURL), "/"))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
-	}
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" {
-		return "", fmt.Errorf("invalid PROXY_RUNTIME_API_BASE_URL")
-	}
-	gateway := &url.URL{
-		Scheme: "http",
-		User:   url.UserPassword(username, password),
-		Host:   net.JoinHostPort(host, proxyRuntimeGatewayPort),
-	}
-	return gateway.String(), nil
-}
-
-func isLocalProxyHost(host string) bool {
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	return host == "" || host == "0.0.0.0" || host == "127.0.0.1" || host == "localhost" || host == "::" || host == "::1"
 }
 
 func proxyRuntimeRouteError(resource string, statusCode int, body []byte) error {

@@ -145,7 +145,11 @@ func (s *Server) accountSettingsRunner(ctx context.Context, requestContext *waap
 	if !ok || strings.TrimSpace(native.activeProxyURL) != "" || s.proxyRuntime == nil {
 		return runner, func() {}, nil
 	}
-	lease, err := s.proxyRuntime.AcquireUSDynamicLease(ctx, DynamicProxyLeaseRequest{
+	username := strings.TrimSpace(s.accountSettingsProxyUsername)
+	if username == "" {
+		return runner, func() {}, nil
+	}
+	route, err := s.proxyRuntime.GatewayProxyRoute(ctx, username, DynamicProxyRouteRequest{
 		Purpose:       "WA_ACCOUNT_SETTINGS",
 		CorrelationID: firstNonEmpty(requestContext.GetCorrelationId(), requestContext.GetRequestId()),
 		TTL:           defaultAccountIQTimeout + 10*time.Second,
@@ -154,12 +158,12 @@ func (s *Server) accountSettingsRunner(ctx context.Context, requestContext *waap
 	if err != nil {
 		return runner, func() {}, nil
 	}
-	proxied, err := native.WithProxyURL(lease.ProxyURL)
+	proxied, err := native.WithProxyURL(route.ProxyURL)
 	if err != nil {
-		s.proxyRuntime.ReleaseLease(context.Background(), lease)
+		_ = s.proxyRuntime.ReleaseProxyRoute(context.Background(), route)
 		return runner, func() {}, nil
 	}
-	return proxied, func() { s.proxyRuntime.ReleaseLease(context.Background(), lease) }, nil
+	return proxied, func() { _ = s.proxyRuntime.ReleaseProxyRoute(context.Background(), route) }, nil
 }
 
 func (s *Server) accountSettingsLoginState(ctx context.Context, workspaceID string, selector *waappv1.AccountLoginSelector) (*waappv1.LoginState, error) {

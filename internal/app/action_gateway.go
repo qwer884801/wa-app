@@ -19,7 +19,7 @@ import (
 
 const transientStateTTL = 30 * time.Minute
 const registrationOTPWaitDefaultTTL = 20 * time.Minute
-const registrationProxyLeaseTTL = 10 * time.Minute
+const registrationProxyRouteTTL = 10 * time.Minute
 
 type registrationOTPWait struct {
 	WorkspaceID           string `json:"workspace_id"`
@@ -29,10 +29,13 @@ type registrationOTPWait struct {
 	CreatedAtUnix         int64  `json:"created_at_unix"`
 }
 
-type registrationProxyLeaseState struct {
+type registrationProxyRouteState struct {
 	AccountID     string `json:"account_id"`
-	LeaseID       string `json:"lease_id"`
+	RouteID       string `json:"route_id"`
+	Username      string `json:"username"`
 	ProxyURL      string `json:"proxy_url"`
+	ProxyMode     string `json:"proxy_mode"`
+	CountryCode   string `json:"country_code"`
 	CreatedAtUnix int64  `json:"created_at_unix"`
 	ExpiresAtUnix int64  `json:"expires_at_unix"`
 }
@@ -154,7 +157,7 @@ func (g *actionGateway) commitFingerprint(ctx context.Context, payload map[strin
 }
 
 func (g *actionGateway) requestSMSOTP(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	runner, lease, managedLease, err := g.registrationRequestRunner(ctx, payload)
+	runner, route, managedRoute, err := g.registrationRequestRunner(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -168,21 +171,21 @@ func (g *actionGateway) requestSMSOTP(ctx context.Context, payload map[string]an
 	}, runner)
 	runner.CloseIdleConnections()
 	if err != nil {
-		if managedLease {
-			g.releaseDynamicLease(context.Background(), lease)
+		if managedRoute {
+			g.releaseProxyRoute(context.Background(), route)
 		}
 		return nil, err
 	}
 	if resp.GetError() != nil {
-		if managedLease {
-			g.releaseDynamicLease(context.Background(), lease)
+		if managedRoute {
+			g.releaseProxyRoute(context.Background(), route)
 		}
 		return map[string]any{"success": false, "error": protoMap(resp.GetError()), "error_message": resp.GetError().GetMessage()}, nil
 	}
 	record := resp.GetVerificationRequest()
-	if managedLease {
-		if err := g.saveRegistrationProxyLease(ctx, reqCtx.GetWorkspaceId(), record.GetVerificationRequestId(), lease); err != nil {
-			g.releaseDynamicLease(context.Background(), lease)
+	if managedRoute {
+		if err := g.saveRegistrationProxyRoute(ctx, reqCtx.GetWorkspaceId(), record.GetVerificationRequestId(), route); err != nil {
+			g.releaseProxyRoute(context.Background(), route)
 			return nil, err
 		}
 	}
@@ -191,7 +194,7 @@ func (g *actionGateway) requestSMSOTP(ctx context.Context, payload map[string]an
 		"status":                  record.GetStatus().String(),
 		"verification_request_id": record.GetVerificationRequestId(),
 		"verification_request":    protoMap(record),
-		"proxy":                   registrationProxyLeaseMap(lease, managedLease),
+		"proxy":                   registrationProxyRouteMap(route, managedRoute),
 	}, nil
 }
 
@@ -351,7 +354,7 @@ func registrationOTPWaitAccountKey(workspaceID string, waAccountIDValue string) 
 }
 
 func (g *actionGateway) submitOTP(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	runner, lease, managedLease, err := g.registrationSubmitRunner(ctx, payload)
+	runner, route, managedRoute, err := g.registrationSubmitRunner(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -362,30 +365,30 @@ func (g *actionGateway) submitOTP(ctx context.Context, payload map[string]any) (
 	}, runner)
 	runner.CloseIdleConnections()
 	if err != nil {
-		if managedLease {
-			g.releaseDynamicLease(context.Background(), lease)
-			_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+		if managedRoute {
+			g.releaseProxyRoute(context.Background(), route)
+			_ = g.deleteRegistrationProxyRoute(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
 		}
 		return nil, err
 	}
 	if resp.GetError() != nil {
-		if managedLease {
-			g.releaseDynamicLease(context.Background(), lease)
-			_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+		if managedRoute {
+			g.releaseProxyRoute(context.Background(), route)
+			_ = g.deleteRegistrationProxyRoute(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
 		}
 		return map[string]any{"success": false, "error": protoMap(resp.GetError()), "error_message": resp.GetError().GetMessage(), "registration": protoMap(resp.GetRegistration())}, nil
 	}
 	success := resp.GetRegistration().GetStatus() == waappv1.RegistrationStatus_REGISTRATION_STATUS_REGISTERED && resp.GetLoginState().GetStatus() == waappv1.LoginStateStatus_LOGIN_STATE_STATUS_ACTIVE
-	if managedLease {
-		g.releaseDynamicLease(context.Background(), lease)
-		_ = g.deleteRegistrationProxyLease(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
+	if managedRoute {
+		g.releaseProxyRoute(context.Background(), route)
+		_ = g.deleteRegistrationProxyRoute(context.Background(), actionContext(payload).GetWorkspaceId(), textField(payload, "verification_request_id"))
 	}
 	return map[string]any{
 		"success":      success,
 		"status":       resp.GetRegistration().GetStatus().String(),
 		"registration": protoMap(resp.GetRegistration()),
 		"login_state":  protoMap(resp.GetLoginState()),
-		"proxy":        registrationProxyLeaseMap(lease, managedLease),
+		"proxy":        registrationProxyRouteMap(route, managedRoute),
 	}, nil
 }
 
@@ -399,7 +402,7 @@ func (g *actionGateway) cleanupFailedRegistration(ctx context.Context, payload m
 			WAAccountID:           accountID,
 			VerificationRequestID: verificationRequestID,
 		})
-		_ = g.releaseRegistrationProxyLease(ctx, reqCtx.GetWorkspaceId(), verificationRequestID)
+		_ = g.releaseRegistrationProxyRoute(ctx, reqCtx.GetWorkspaceId(), verificationRequestID)
 	}
 	if accountID == "" {
 		return map[string]any{"success": true, "deleted": false, "reason": "missing_wa_account_id"}, nil
@@ -583,168 +586,176 @@ func (g *actionGateway) nativeEngineForPayload(payload map[string]any) (*NativeE
 	return engine.WithProxyURL(proxyURL)
 }
 
-func (g *actionGateway) registrationRequestRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyLease, bool, error) {
+func (g *actionGateway) registrationRequestRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyRoute, bool, error) {
 	engine, err := g.nativeEngineForPayload(payload)
 	if err != nil {
-		return nil, DynamicProxyLease{}, false, err
+		return nil, DynamicProxyRoute{}, false, err
 	}
 	if actionProxyURL(payload) != "" {
-		return engine, DynamicProxyLease{}, false, nil
+		return engine, DynamicProxyRoute{}, false, nil
 	}
 	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
-		return engine, DynamicProxyLease{}, false, nil
+		return engine, DynamicProxyRoute{}, false, nil
 	}
-	lease, err := g.acquireRegistrationStickyProxy(ctx, payload, "WA_REGISTRATION_REQUEST_SMS")
+	route, err := g.registrationGatewayProxy(ctx, payload, "WA_REGISTRATION_REQUEST_SMS")
 	if err != nil {
-		return engine, DynamicProxyLease{}, false, nil
+		return engine, DynamicProxyRoute{}, false, nil
 	}
-	proxied, err := engine.WithProxyURL(lease.ProxyURL)
+	proxied, err := engine.WithProxyURL(route.ProxyURL)
 	if err != nil {
-		g.releaseDynamicLease(context.Background(), lease)
-		return nil, DynamicProxyLease{}, false, err
+		g.releaseProxyRoute(context.Background(), route)
+		return nil, DynamicProxyRoute{}, false, err
 	}
-	return proxied, lease, true, nil
+	return proxied, route, true, nil
 }
 
-func (g *actionGateway) registrationSubmitRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyLease, bool, error) {
+func (g *actionGateway) registrationSubmitRunner(ctx context.Context, payload map[string]any) (*NativeEngine, DynamicProxyRoute, bool, error) {
 	engine, err := g.nativeEngineForPayload(payload)
 	if err != nil {
-		return nil, DynamicProxyLease{}, false, err
+		return nil, DynamicProxyRoute{}, false, err
 	}
 	if actionProxyURL(payload) != "" {
-		return engine, DynamicProxyLease{}, false, nil
+		return engine, DynamicProxyRoute{}, false, nil
 	}
 	workspaceID := actionContext(payload).GetWorkspaceId()
 	verificationRequestID := textField(payload, "verification_request_id")
-	lease, err := g.loadRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
-	if err == nil && registrationProxyLeaseExpired(lease, time.Now().UTC()) {
-		g.releaseDynamicLease(context.Background(), lease)
-		_ = g.deleteRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+	route, err := g.loadRegistrationProxyRoute(ctx, workspaceID, verificationRequestID)
+	if err == nil && registrationProxyRouteExpired(route, time.Now().UTC()) {
+		g.releaseProxyRoute(context.Background(), route)
+		_ = g.deleteRegistrationProxyRoute(ctx, workspaceID, verificationRequestID)
 		err = NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "registration proxy session expired", false)
 	}
 	if err != nil {
 		if g == nil || g.server == nil || g.server.proxyRuntime == nil {
-			return engine, DynamicProxyLease{}, false, nil
+			return engine, DynamicProxyRoute{}, false, nil
 		}
-		lease, err = g.acquireRegistrationStickyProxy(ctx, payload, "WA_REGISTRATION_SUBMIT_OTP")
+		route, err = g.registrationGatewayProxy(ctx, payload, "WA_REGISTRATION_SUBMIT_OTP")
 		if err != nil {
-			return engine, DynamicProxyLease{}, false, nil
+			return engine, DynamicProxyRoute{}, false, nil
 		}
-		if saveErr := g.saveRegistrationProxyLease(ctx, workspaceID, verificationRequestID, lease); saveErr != nil {
-			g.releaseDynamicLease(context.Background(), lease)
-			return nil, DynamicProxyLease{}, false, saveErr
+		if saveErr := g.saveRegistrationProxyRoute(ctx, workspaceID, verificationRequestID, route); saveErr != nil {
+			g.releaseProxyRoute(context.Background(), route)
+			return nil, DynamicProxyRoute{}, false, saveErr
 		}
 	}
-	proxied, err := engine.WithProxyURL(lease.ProxyURL)
+	proxied, err := engine.WithProxyURL(route.ProxyURL)
 	if err != nil {
-		g.releaseDynamicLease(context.Background(), lease)
-		return nil, DynamicProxyLease{}, false, err
+		g.releaseProxyRoute(context.Background(), route)
+		return nil, DynamicProxyRoute{}, false, err
 	}
-	return proxied, lease, true, nil
+	return proxied, route, true, nil
 }
 
-func (g *actionGateway) acquireRegistrationStickyProxy(ctx context.Context, payload map[string]any, purpose string) (DynamicProxyLease, error) {
+func (g *actionGateway) registrationGatewayProxy(ctx context.Context, payload map[string]any, purpose string) (DynamicProxyRoute, error) {
 	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
-		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "PROXY_RUNTIME_API_BASE_URL is required", false)
+		return DynamicProxyRoute{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "PROXY_RUNTIME_API_BASE_URL is required", false)
 	}
-	return g.server.proxyRuntime.AcquireUSDynamicLease(ctx, DynamicProxyLeaseRequest{
+	username := strings.TrimSpace(g.server.registrationProxyUsername)
+	if username == "" {
+		return DynamicProxyRoute{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "WA_REGISTRATION_PROXY_USERNAME is required", false)
+	}
+	return g.server.proxyRuntime.GatewayProxyRoute(ctx, username, DynamicProxyRouteRequest{
 		Purpose:       purpose,
 		CorrelationID: firstNonEmpty(textField(payload, "job_id"), textField(payload, "request_id"), textField(payload, "verification_request_id")),
-		TTL:           registrationProxyLeaseTTL,
+		TTL:           registrationProxyRouteTTL,
 		Mode:          DynamicProxySessionModeSticky,
 	})
 }
 
-func (g *actionGateway) saveRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string, lease DynamicProxyLease) error {
-	if strings.TrimSpace(verificationRequestID) == "" || strings.TrimSpace(lease.ProxyURL) == "" {
+func (g *actionGateway) saveRegistrationProxyRoute(ctx context.Context, workspaceID string, verificationRequestID string, route DynamicProxyRoute) error {
+	if strings.TrimSpace(verificationRequestID) == "" || strings.TrimSpace(route.ProxyURL) == "" {
 		return nil
 	}
 	now := time.Now().UTC()
-	expiresAt := lease.ExpiresAt
+	expiresAt := route.ExpiresAt
 	if expiresAt.IsZero() {
-		expiresAt = now.Add(registrationProxyLeaseTTL)
+		expiresAt = now.Add(registrationProxyRouteTTL)
 	}
-	data, err := json.Marshal(registrationProxyLeaseState{
-		AccountID:     lease.AccountID,
-		LeaseID:       lease.LeaseID,
-		ProxyURL:      lease.ProxyURL,
+	data, err := json.Marshal(registrationProxyRouteState{
+		AccountID:     route.AccountID,
+		RouteID:       route.RouteID,
+		Username:      route.Username,
+		ProxyURL:      route.ProxyURL,
+		ProxyMode:     route.ProxyMode,
+		CountryCode:   route.CountryCode,
 		CreatedAtUnix: now.Unix(),
 		ExpiresAtUnix: expiresAt.UTC().Unix(),
 	})
 	if err != nil {
 		return err
 	}
-	return g.server.runtime.SaveTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID), data, registrationOTPWaitDefaultTTL)
+	return g.server.runtime.SaveTransientState(ctx, registrationProxyRouteKey(workspaceID, verificationRequestID), data, registrationOTPWaitDefaultTTL)
 }
 
-func (g *actionGateway) loadRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) (DynamicProxyLease, error) {
+func (g *actionGateway) loadRegistrationProxyRoute(ctx context.Context, workspaceID string, verificationRequestID string) (DynamicProxyRoute, error) {
 	if strings.TrimSpace(verificationRequestID) == "" {
-		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "verification_request_id is required", false)
+		return DynamicProxyRoute{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "verification_request_id is required", false)
 	}
-	data, err := g.server.runtime.GetTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID))
+	data, err := g.server.runtime.GetTransientState(ctx, registrationProxyRouteKey(workspaceID, verificationRequestID))
 	if err != nil {
-		return DynamicProxyLease{}, err
+		return DynamicProxyRoute{}, err
 	}
-	var state registrationProxyLeaseState
+	var state registrationProxyRouteState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return DynamicProxyLease{}, err
+		return DynamicProxyRoute{}, err
 	}
 	if strings.TrimSpace(state.ProxyURL) == "" {
-		return DynamicProxyLease{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "registration proxy lease is missing proxy_url", false)
+		return DynamicProxyRoute{}, NewError(waappv1.WaErrorCode_WA_ERROR_CODE_ROUTE_UNAVAILABLE, "registration proxy route is missing proxy_url", false)
 	}
-	lease := DynamicProxyLease{AccountID: state.AccountID, LeaseID: state.LeaseID, ProxyURL: state.ProxyURL}
+	route := DynamicProxyRoute{AccountID: state.AccountID, RouteID: state.RouteID, Username: state.Username, ProxyURL: state.ProxyURL, ProxyMode: state.ProxyMode, CountryCode: state.CountryCode}
 	if state.ExpiresAtUnix > 0 {
-		lease.ExpiresAt = time.Unix(state.ExpiresAtUnix, 0).UTC()
+		route.ExpiresAt = time.Unix(state.ExpiresAtUnix, 0).UTC()
 	}
-	return lease, nil
+	return route, nil
 }
 
-func (g *actionGateway) releaseRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) error {
+func (g *actionGateway) releaseRegistrationProxyRoute(ctx context.Context, workspaceID string, verificationRequestID string) error {
 	if strings.TrimSpace(verificationRequestID) == "" {
 		return nil
 	}
-	lease, err := g.loadRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+	route, err := g.loadRegistrationProxyRoute(ctx, workspaceID, verificationRequestID)
 	if err == nil {
-		g.releaseDynamicLease(context.Background(), lease)
+		g.releaseProxyRoute(context.Background(), route)
 	}
-	return g.deleteRegistrationProxyLease(ctx, workspaceID, verificationRequestID)
+	return g.deleteRegistrationProxyRoute(ctx, workspaceID, verificationRequestID)
 }
 
-func (g *actionGateway) releaseDynamicLease(ctx context.Context, lease DynamicProxyLease) {
+func (g *actionGateway) releaseProxyRoute(ctx context.Context, route DynamicProxyRoute) {
 	if g == nil || g.server == nil || g.server.proxyRuntime == nil {
 		return
 	}
-	g.server.proxyRuntime.ReleaseLease(ctx, lease)
+	_ = g.server.proxyRuntime.ReleaseProxyRoute(ctx, route)
 }
 
-func (g *actionGateway) deleteRegistrationProxyLease(ctx context.Context, workspaceID string, verificationRequestID string) error {
+func (g *actionGateway) deleteRegistrationProxyRoute(ctx context.Context, workspaceID string, verificationRequestID string) error {
 	if strings.TrimSpace(verificationRequestID) == "" {
 		return nil
 	}
-	return g.server.runtime.DeleteTransientState(ctx, registrationProxyLeaseKey(workspaceID, verificationRequestID))
+	return g.server.runtime.DeleteTransientState(ctx, registrationProxyRouteKey(workspaceID, verificationRequestID))
 }
 
-func registrationProxyLeaseKey(workspaceID string, verificationRequestID string) string {
-	return "wa-registration-proxy-lease:verification:" + workspaceID + ":" + verificationRequestID
+func registrationProxyRouteKey(workspaceID string, verificationRequestID string) string {
+	return "wa-registration-proxy-route:verification:" + workspaceID + ":" + verificationRequestID
 }
 
-func registrationProxyLeaseExpired(lease DynamicProxyLease, now time.Time) bool {
-	return !lease.ExpiresAt.IsZero() && !lease.ExpiresAt.After(now)
+func registrationProxyRouteExpired(route DynamicProxyRoute, now time.Time) bool {
+	return !route.ExpiresAt.IsZero() && !route.ExpiresAt.After(now)
 }
 
-func registrationProxyLeaseMap(lease DynamicProxyLease, managed bool) map[string]any {
+func registrationProxyRouteMap(route DynamicProxyRoute, managed bool) map[string]any {
 	if !managed {
 		return map[string]any{}
 	}
 	result := map[string]any{
-		"proxy_mode":   "US_STICKY_DYNAMIC_IP",
-		"country_code": "US",
-		"account_id":   lease.AccountID,
-		"lease_id":     lease.LeaseID,
-		"proxy_url":    lease.ProxyURL,
+		"proxy_mode":     firstNonEmpty(route.ProxyMode, "US_STICKY_DYNAMIC_IP"),
+		"country_code":   firstNonEmpty(route.CountryCode, "US"),
+		"account_id":     route.AccountID,
+		"route_id":       route.RouteID,
+		"proxy_url":      route.ProxyURL,
+		"proxy_username": route.Username,
 	}
-	if !lease.ExpiresAt.IsZero() {
-		result["expires_at"] = lease.ExpiresAt.UTC().Format(time.RFC3339)
+	if !route.ExpiresAt.IsZero() {
+		result["expires_at"] = route.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 	return result
 }

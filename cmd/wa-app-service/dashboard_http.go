@@ -27,27 +27,23 @@ import (
 )
 
 type dashboardHTTP struct {
-	staticDir        string
-	n8nWebhookBase   string
-	proxyRuntimeBase string
-	proxyRuntime     *app.DynamicProxyRuntime
-	client           *http.Client
-	service          *app.Server
-	actionHandler    http.Handler
+	staticDir      string
+	n8nWebhookBase string
+	client         *http.Client
+	service        *app.Server
+	actionHandler  http.Handler
 }
 
-func runDashboardHTTP(ctx context.Context, listenAddr, staticDir, n8nWebhookBase string, proxyRuntimeBase string, service *app.Server, actionHandler http.Handler) error {
+func runDashboardHTTP(ctx context.Context, listenAddr, staticDir, n8nWebhookBase string, service *app.Server, actionHandler http.Handler) error {
 	if strings.TrimSpace(listenAddr) == "" {
 		return nil
 	}
 	server := &dashboardHTTP{
-		staticDir:        firstNonEmpty(staticDir, "/app/dashboard/wa"),
-		n8nWebhookBase:   strings.TrimRight(strings.TrimSpace(n8nWebhookBase), "/"),
-		proxyRuntimeBase: strings.TrimRight(strings.TrimSpace(proxyRuntimeBase), "/"),
-		proxyRuntime:     app.NewDynamicProxyRuntime(proxyRuntimeBase),
-		client:           &http.Client{Timeout: 7 * time.Minute},
-		service:          service,
-		actionHandler:    actionHandler,
+		staticDir:      firstNonEmpty(staticDir, "/app/dashboard/wa"),
+		n8nWebhookBase: strings.TrimRight(strings.TrimSpace(n8nWebhookBase), "/"),
+		client:         &http.Client{Timeout: 7 * time.Minute},
+		service:        service,
+		actionHandler:  actionHandler,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/wa/health", server.handleHealth)
@@ -331,20 +327,15 @@ func (s *dashboardHTTP) handleLoginStateCheck(w http.ResponseWriter, r *http.Req
 	payload["workspace_id"] = firstNonEmpty(textField(payload, "workspace_id"), "default")
 	payload["request_id"] = firstNonEmpty(textField(payload, "request_id"), newRequestID("wa-req"))
 	payload["job_id"] = firstNonEmpty(textField(payload, "job_id"), newRequestID("wa-login-state-check"))
-	if textField(payload, "proxy_url") == "" && textField(objectField(payload, "proxy"), "proxy_url") == "" && s.proxyRuntime != nil {
-		lease, err := s.proxyRuntime.AcquireUSDynamicLease(r.Context(), app.DynamicProxyLeaseRequest{
-			Purpose:       "WA_LOGIN_STATE_CHECK",
-			CorrelationID: firstNonEmpty(textField(payload, "job_id"), textField(payload, "request_id")),
-			TTL:           10 * time.Minute,
-			Mode:          app.DynamicProxySessionModeRotating,
-		})
+	if textField(payload, "proxy_url") == "" && textField(objectField(payload, "proxy"), "proxy_url") == "" && s.service != nil {
+		route, err := s.service.LoginStateCheckProxyRoute(r.Context(), firstNonEmpty(textField(payload, "job_id"), textField(payload, "request_id")), 10*time.Minute)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "status": "US_DYNAMIC_IP_UNAVAILABLE", "error_message": "US rotating dynamic IP unavailable", "proxy": map[string]string{"proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US"}})
 			return
 		}
-		defer s.proxyRuntime.ReleaseLease(context.Background(), lease)
-		payload["proxy_url"] = lease.ProxyURL
-		payload["proxy"] = map[string]any{"proxy_mode": "US_ROTATING_DYNAMIC_IP", "country_code": "US", "account_id": lease.AccountID, "lease_id": lease.LeaseID}
+		defer s.service.ReleaseProxyRoute(context.Background(), route)
+		payload["proxy_url"] = route.ProxyURL
+		payload["proxy"] = map[string]any{"proxy_mode": route.ProxyMode, "country_code": route.CountryCode, "account_id": route.AccountID, "route_id": route.RouteID, "proxy_username": route.Username}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

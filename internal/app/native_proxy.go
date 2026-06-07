@@ -17,5 +17,5 @@ func (e *NativeEngine) proxyURL() (string, error) {
 	if proxyURL := strings.TrimSpace(e.activeProxyURL); proxyURL != "" {
 		return proxyURL, nil
 	}
-	return "", NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "proxy_url is required; WA runtime must use a proxy-runtime US dynamic IP lease", false)
+	return "", NewError(waappv1.WaErrorCode_WA_ERROR_CODE_VALIDATION_FAILED, "proxy_url is required; WA runtime must use a proxy-runtime US dynamic IP route", false)
 }

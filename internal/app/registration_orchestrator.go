@@ -29,7 +29,7 @@ func (s *Server) StartRegistration(ctx context.Context, payload map[string]any) 
 	if err != nil {
 		return nil, err
 	}
-	runner, lease, managedLease, err := gateway.registrationRequestRunner(ctx, basePayload)
+	runner, route, managedRoute, err := gateway.registrationRequestRunner(ctx, basePayload)
 	if err != nil {
 		return nil, err
 	}
@@ -39,30 +39,20 @@ func (s *Server) StartRegistration(ctx context.Context, payload map[string]any) 
 	runner.CloseIdleConnections()
 	_ = gateway.server.runtime.DeleteTransientState(context.Background(), fingerprintRef)
 	if !verificationCodeRequestAccepted(codeResult) {
-		if managedLease {
-			gateway.releaseDynamicLease(context.Background(), lease)
-		}
-		return rejectedRegistrationResult(basePayload, registrationRequestFailureMap(codeResult, lease, managedLease)), nil
+		return rejectedRegistrationResult(basePayload, registrationRequestFailureMap(codeResult, route, managedRoute)), nil
 	}
 	account, profile, protocol, err := gateway.server.commitNativeState(ctx, reqCtx, phone, updatedState)
 	if err != nil {
-		if managedLease {
-			gateway.releaseDynamicLease(context.Background(), lease)
-		}
 		return nil, err
 	}
 	record := gateway.server.newVerificationCodeRequestRecord(account, profile, waappv1.VerificationDeliveryMethod_VERIFICATION_DELIVERY_METHOD_SMS, codeResult)
 	if err := gateway.server.store.SaveVerificationRequest(ctx, record, reqCtx.GetWorkspaceId()); err != nil {
-		if managedLease {
-			gateway.releaseDynamicLease(context.Background(), lease)
-		}
 		_ = gateway.discardRejectedRegistration(context.Background(), basePayload, waAccountID(account), record.GetVerificationRequestId())
 		return nil, err
 	}
 	verificationRequestID := record.GetVerificationRequestId()
-	if managedLease {
-		if err := gateway.saveRegistrationProxyLease(ctx, reqCtx.GetWorkspaceId(), verificationRequestID, lease); err != nil {
-			gateway.releaseDynamicLease(context.Background(), lease)
+	if managedRoute {
+		if err := gateway.saveRegistrationProxyRoute(ctx, reqCtx.GetWorkspaceId(), verificationRequestID, route); err != nil {
 			_ = gateway.discardRejectedRegistration(context.Background(), basePayload, waAccountID(account), verificationRequestID)
 			return nil, err
 		}
@@ -74,7 +64,7 @@ func (s *Server) StartRegistration(ctx context.Context, payload map[string]any) 
 		CreatedAtUnix:         time.Now().UTC().Unix(),
 	}
 	if err := gateway.saveRegistrationOTPWait(ctx, wait, registrationOTPWaitDefaultTTL); err != nil {
-		_ = gateway.releaseRegistrationProxyLease(context.Background(), wait.WorkspaceID, wait.VerificationRequestID)
+		_ = gateway.releaseRegistrationProxyRoute(context.Background(), wait.WorkspaceID, wait.VerificationRequestID)
 		_ = gateway.discardRejectedRegistration(context.Background(), basePayload, waAccountID(account), verificationRequestID)
 		return nil, err
 	}
@@ -91,7 +81,7 @@ func (s *Server) StartRegistration(ctx context.Context, payload map[string]any) 
 		"registration_phase":      registrationPhase(true, verificationRequestID),
 		"fingerprint_persistence": "COMMITTED",
 		"persisted":               true,
-		"proxy":                   registrationOrchestratorProxySummary(registrationProxyLeaseMap(lease, managedLease)),
+		"proxy":                   registrationOrchestratorProxySummary(registrationProxyRouteMap(route, managedRoute)),
 	}, nil
 }
 
@@ -114,21 +104,21 @@ func verificationCodeRequestAccepted(result EngineCodeResult) bool {
 	return result.Err == nil && (result.Status == waappv1.VerificationRequestStatus_VERIFICATION_REQUEST_STATUS_SENT || result.Status == waappv1.VerificationRequestStatus_VERIFICATION_REQUEST_STATUS_WAITING)
 }
 
-func registrationRequestFailureMap(result EngineCodeResult, lease DynamicProxyLease, managedLease bool) map[string]any {
+func registrationRequestFailureMap(result EngineCodeResult, route DynamicProxyRoute, managedRoute bool) map[string]any {
 	protoErr := ToProtoError(result.Err)
 	return map[string]any{
 		"success":       false,
 		"status":        firstNonEmpty(result.Status.String(), "VERIFICATION_REQUEST_STATUS_REJECTED"),
 		"error":         protoMap(protoErr),
 		"error_message": protoErr.GetMessage(),
-		"proxy":         registrationProxyLeaseMap(lease, managedLease),
+		"proxy":         registrationProxyRouteMap(route, managedRoute),
 	}
 }
 
 func (g *actionGateway) discardRejectedRegistration(ctx context.Context, basePayload map[string]any, waAccountID string, verificationRequestID string) error {
 	workspaceID := actionContext(basePayload).GetWorkspaceId()
 	if strings.TrimSpace(verificationRequestID) != "" {
-		_ = g.releaseRegistrationProxyLease(context.Background(), workspaceID, verificationRequestID)
+		_ = g.releaseRegistrationProxyRoute(context.Background(), workspaceID, verificationRequestID)
 	}
 	if strings.TrimSpace(waAccountID) == "" {
 		return nil

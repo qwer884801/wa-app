@@ -42,8 +42,14 @@ func main() {
 		log.Fatalf("initialize wa-app native engine: %v", err)
 	}
 	service := app.NewServer(store, runtime, engine, clock, ids)
-	service.SetDynamicProxyRuntime(app.NewDynamicProxyRuntime(cfg.ProxyRuntimeAPIURL))
-	service.SetLongConnectionProxyUsername(cfg.LongConnectionProxyUsername)
+	service.SetDynamicProxyRuntime(app.NewDynamicProxyRuntime(cfg.ProxyRuntimeAPIURL, cfg.ProxyRuntimeLocalProtocol))
+	service.SetGatewayProxyUsernames(
+		cfg.LongConnectionProxyUsername,
+		cfg.NumberProbeProxyUsername,
+		cfg.RegistrationProxyUsername,
+		cfg.AccountSettingsProxyUsername,
+		cfg.LoginStateCheckProxyUsername,
+	)
 	platformBus, err := newPlatformEventBus(cfg)
 	if err != nil {
 		log.Fatalf("initialize wa-app platform event bus: %v", err)
@@ -81,7 +87,7 @@ func main() {
 		return nil
 	})
 	group.Go(func() error {
-		return runDashboardHTTP(groupCtx, cfg.DashboardHTTPAddr, cfg.DashboardStaticDir, cfg.N8NWebhookBaseURL, cfg.ProxyRuntimeAPIURL, service, newWAActionHandler(service))
+		return runDashboardHTTP(groupCtx, cfg.DashboardHTTPAddr, cfg.DashboardStaticDir, cfg.N8NWebhookBaseURL, service, newWAActionHandler(service))
 	})
 	group.Go(func() error {
 		return service.RunLongConnections(groupCtx)

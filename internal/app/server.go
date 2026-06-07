@@ -26,11 +26,15 @@ type Server struct {
 	clock   Clock
 	ids     IDGenerator
 
-	proxyRuntime      *DynamicProxyRuntime
-	longProxyUsername string
-	platformPublisher eventbus.Publisher
-	accountPublisher  *accountevent.Publisher
-	longConnections   *LongConnectionManager
+	proxyRuntime                 *DynamicProxyRuntime
+	longProxyUsername            string
+	numberProbeProxyUsername     string
+	registrationProxyUsername    string
+	accountSettingsProxyUsername string
+	loginStateCheckProxyUsername string
+	platformPublisher            eventbus.Publisher
+	accountPublisher             *accountevent.Publisher
+	longConnections              *LongConnectionManager
 }
 
 func NewServer(store Store, runtime RuntimeState, runner ProtocolEngine, clock Clock, ids IDGenerator) *Server {
@@ -49,8 +53,12 @@ func (s *Server) SetDynamicProxyRuntime(proxyRuntime *DynamicProxyRuntime) {
 	s.proxyRuntime = proxyRuntime
 }
 
-func (s *Server) SetLongConnectionProxyUsername(username string) {
-	s.longProxyUsername = strings.TrimSpace(username)
+func (s *Server) SetGatewayProxyUsernames(longConnection string, numberProbe string, registration string, accountSettings string, loginStateCheck string) {
+	s.longProxyUsername = strings.TrimSpace(longConnection)
+	s.numberProbeProxyUsername = strings.TrimSpace(numberProbe)
+	s.registrationProxyUsername = strings.TrimSpace(registration)
+	s.accountSettingsProxyUsername = strings.TrimSpace(accountSettings)
+	s.loginStateCheckProxyUsername = strings.TrimSpace(loginStateCheck)
 }
 
 func (s *Server) SetPlatformPublisher(publisher eventbus.Publisher) {
